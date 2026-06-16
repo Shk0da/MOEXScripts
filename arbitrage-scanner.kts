@@ -1,5 +1,6 @@
 #!/usr/bin/env kotlin
 
+import java.io.FileInputStream
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -7,11 +8,27 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.time.LocalDate
 import java.time.temporal.ChronoUnit
+import java.util.Properties
 import kotlin.math.max
 import org.w3c.dom.Document
 import org.w3c.dom.Element
 import org.w3c.dom.NodeList
 import javax.xml.parsers.DocumentBuilderFactory
+
+// Загрузка конфигурации из application.properties
+fun loadProperties(): Properties {
+    val props = Properties()
+    try {
+        val scriptPath = object {}.javaClass.classLoader.getResource("application.properties")?.path
+            ?: "${System.getProperty("user.dir")}/application.properties"
+        props.load(FileInputStream(scriptPath))
+    } catch (e: Exception) {
+        println("  [WARN] Не удалось загрузить application.properties: ${e.message}")
+    }
+    return props
+}
+
+val tcsApiKey = loadProperties().getProperty("tcs.apiKey", "")
 
 // Конфигурация сканера
 data class Config(
@@ -122,38 +139,178 @@ class XmlParser {
     }
 }
 
+// Клиент для работы с T-Invest API (стакан)
+class TcsClient {
+    private val http = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(15))
+        .build()
+    private val parser = XmlParser()
+
+    // Получение цены из стакана (средняя между bid и ask)
+    fun getOrderBookPrice(ticker: String, classCode: String = "TQBR"): StockData? {
+        if (tcsApiKey.isBlank()) return null
+        
+        return try {
+            val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetOrderBook"
+            val requestBody = """{"depth": 1, "instrumentId": "${ticker}_${classCode}"}"""
+            
+            val resp = http.send(
+                HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Authorization", "Bearer $tcsApiKey")
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                    .build(),
+                HttpResponse.BodyHandlers.ofString()
+            )
+            
+            if (resp.statusCode() != 200) {
+                println("  [$ticker] TCS API HTTP ${resp.statusCode()}")
+                return null
+            }
+            
+            // Парсим JSON ответ
+            val json = resp.body()
+            val bids = extractJsonArray(json, "bids")
+            val asks = extractJsonArray(json, "asks")
+            
+            if (bids.isEmpty() || asks.isEmpty()) return null
+            
+            val bestBid = extractJsonObject(bids[0], "price")?.toDoubleOrNull() ?: 0.0
+            val bestAsk = extractJsonObject(asks[0], "price")?.toDoubleOrNull() ?: 0.0
+            
+            if (bestBid <= 0 || bestAsk <= 0) return null
+            
+            // Средняя цена между лучшей покупкой и продажей
+            val midPrice = (bestBid + bestAsk) / 2.0
+            println("  [$ticker] Стакан: bid=$bestBid, ask=$bestAsk, mid=$midPrice")
+            StockData(ticker, midPrice)
+        } catch (e: Exception) {
+            println("  [$ticker] TCS ошибка: ${e.message}")
+            null
+        }
+    }
+
+    // Вспомогательные функции для парсинга JSON
+    private fun extractJsonArray(json: String, key: String): List<String> {
+        val startIndex = json.indexOf("\"$key\"")
+        if (startIndex < 0) return emptyList()
+        val arrayStart = json.indexOf('[', startIndex)
+        if (arrayStart < 0) return emptyList()
+        val content = extractBalancedBrackets(json, arrayStart)
+        return splitJsonArray(content)
+    }
+
+    private fun extractJsonObject(json: String, key: String): String? {
+        val startIndex = json.indexOf("\"$key\"")
+        if (startIndex < 0) return null
+        val colonIndex = json.indexOf(':', startIndex)
+        if (colonIndex < 0) return null
+        val valueStart = colonIndex + 1
+        while (valueStart < json.length && (json[valueStart] == ' ' || json[valueStart] == '"')) {
+            if (json[valueStart] == '"') {
+                val valueEnd = json.indexOf('"', valueStart + 1)
+                return if (valueEnd > 0) json.substring(valueStart + 1, valueEnd) else null
+            }
+        }
+        return null
+    }
+
+    private fun extractBalancedBrackets(text: String, openPos: Int): String {
+        if (openPos >= text.length || text[openPos] != '[') return ""
+        var depth = 0
+        var inString = false
+        var i = openPos
+        while (i < text.length) {
+            val ch = text[i]
+            if (inString) {
+                if (ch == '\\') { i += 2; continue }
+                if (ch == '"') inString = false
+            } else {
+                when (ch) {
+                    '"' -> inString = true
+                    '[' -> depth++
+                    ']' -> {
+                        depth--
+                        if (depth == 0) return text.substring(openPos + 1, i)
+                    }
+                }
+            }
+            i++
+        }
+        return text.substring(openPos + 1)
+    }
+
+    private fun splitJsonArray(content: String): List<String> {
+        val result = mutableListOf<String>()
+        var depth = 0
+        var inString = false
+        val current = StringBuilder()
+        
+        for (ch in content) {
+            when {
+                ch == '"' && !inString -> inString = true
+                ch == '"' && inString -> inString = false
+                ch == '{' && !inString -> {
+                    depth++
+                    current.append(ch)
+                }
+                ch == '}' && !inString -> {
+                    depth--
+                    current.append(ch)
+                    if (depth == 0) {
+                        result.add(current.toString())
+                        current.clear()
+                    }
+                }
+                depth > 0 -> current.append(ch)
+            }
+        }
+        return result
+    }
+}
+
 // Клиент для работы с MOEX ISS API
 class MoexClient {
     private val http = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(15))
         .build()
     private val parser = XmlParser()
+    private val tcsClient = TcsClient()
 
-    // Получение цены акции по тикеру
-    fun getStockPrice(ticker: String): StockData? = try {
-        val url = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.xml?securities=$ticker"
-        val resp = http.send(
-            HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .GET()
-                .build(),
-            HttpResponse.BodyHandlers.ofString()
-        )
-        if (resp.statusCode() != 200) {
-            println("  [$ticker] HTTP ${resp.statusCode()}")
-            return null
+    // Получение цены акции по тикеру (с приоритетом T-Invest API)
+    fun getStockPrice(ticker: String, useOrderBook: Boolean = true): StockData? {
+        // Сначала пробуем получить цену из стакана T-Invest
+        if (useOrderBook && tcsApiKey.isNotBlank()) {
+            tcsClient.getOrderBookPrice(ticker)?.let { return it }
         }
-        val doc = parser.parse(resp.body())
-        val rows = parser.getRows(doc, "marketdata")
-        if (rows.isEmpty()) return null
         
-        val lastPrice = rows[0].getAttribute("LAST").toDoubleOrNull() ?: return null
-        if (lastPrice <= 0) return null
-        
-        StockData(ticker, lastPrice)
-    } catch (e: Exception) {
-        println("  [$ticker] ошибка: ${e.message}")
-        null
+        // Фоллбэк на MOEX ISS
+        return try {
+            val url = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.xml?securities=$ticker"
+            val resp = http.send(
+                HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .GET()
+                    .build(),
+                HttpResponse.BodyHandlers.ofString()
+            )
+            if (resp.statusCode() != 200) {
+                println("  [$ticker] MOEX HTTP ${resp.statusCode()}")
+                return null
+            }
+            val doc = parser.parse(resp.body())
+            val rows = parser.getRows(doc, "marketdata")
+            if (rows.isEmpty()) return null
+            
+            val lastPrice = rows[0].getAttribute("LAST").toDoubleOrNull() ?: return null
+            if (lastPrice <= 0) return null
+            
+            StockData(ticker, lastPrice)
+        } catch (e: Exception) {
+            println("  [$ticker] ошибка: ${e.message}")
+            null
+        }
     }
 
     // Получение всех фьючерсов с ценами
@@ -219,6 +376,7 @@ class MoexClient {
 class ArbitrageScanner(private val config: Config) {
     private val moex = MoexClient()
     private val used = mutableSetOf<String>()
+    var useOrderBook: Boolean = true  // Использовать стакан T-Invest API
 
     // Расчет платы за перенос шорт-позиции через ночь (овернайт)
     // Тарифы: https://bcs.ru/comissions/for-all/short
@@ -282,7 +440,7 @@ class ArbitrageScanner(private val config: Config) {
             used.add(ac)
             
             print("  $t ($ac): ")
-            val stock = moex.getStockPrice(t) ?: continue
+            val stock = moex.getStockPrice(t, useOrderBook) ?: continue
             println("${"%.2f".format(stock.price)} руб.")
             
             val tf = activeFutures[ac] ?: continue
@@ -465,6 +623,7 @@ fun main(args: Array<String>) {
     var commission = 0.05
     var tickers: List<String>? = null
     var overnightRate = true
+    var useOrderBook = true  // Использовать стакан T-Invest API
     
     var i = 0
     while (i < args.size) {
@@ -474,6 +633,7 @@ fun main(args: Array<String>) {
             "--commission" -> commission = args[++i].toDouble()
             "--tickers" -> tickers = args[++i].split(",").map { it.trim().uppercase() }
             "--no-overnight" -> overnightRate = false
+            "--no-orderbook" -> useOrderBook = false
         }
         i++
     }
@@ -486,6 +646,7 @@ fun main(args: Array<String>) {
         tickers = tickers ?: Config().tickers
     )
     val sc = ArbitrageScanner(cfg)
+    sc.useOrderBook = useOrderBook
     val opps = sc.scan()
     sc.printReport(opps)
 }

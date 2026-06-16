@@ -19,6 +19,20 @@
 
 - Kotlin 1.9+ (для запуска скриптов .kts)
 - Доступ к интернету (данные загружаются с MOEX ISS API)
+- T-Invest API токен (опционально, для получения цен из стакана)
+
+## Настройка T-Invest API
+
+Для получения более точных цен из стакана создайте файл `application.properties`:
+
+```properties
+tcs.accountId=your-account-id
+tcs.apiKey=your-api-key
+```
+
+Токен можно получить в личном кабинете T-Invest API.
+
+Если токен не указан, скрипт будет использовать цены MOEX.
 
 ## Запуск
 
@@ -40,6 +54,9 @@ kotlin arbitrage-scanner.kts --tickers SBER,GAZP,ROSN
 
 # Отключить плату за овернайт
 kotlin arbitrage-scanner.kts --no-overnight
+
+# Отключить использование стакана T-Invest API (использовать MOEX)
+kotlin arbitrage-scanner.kts --no-orderbook
 
 # Комбинация параметров
 kotlin arbitrage-scanner.kts --capital 1000000 --position-size 50000 --commission 0.03 --tickers SBER,TATN
