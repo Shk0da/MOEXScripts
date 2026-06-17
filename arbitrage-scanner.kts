@@ -5,10 +5,15 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.time.Duration
 import java.time.LocalDate
 import java.time.temporal.ChronoUnit
 import java.util.Properties
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 import kotlin.math.max
 import org.w3c.dom.Document
 import org.w3c.dom.Element
@@ -139,10 +144,23 @@ class XmlParser {
     }
 }
 
+// SSL context, доверяющий всем сертификатам (необходимо для российских CA)
+fun createTrustAllSSLContext(): SSLContext {
+    val trustAll = object : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+        override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
+        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+    }
+    val sslContext = SSLContext.getInstance("TLS")
+    sslContext.init(null, arrayOf<TrustManager>(trustAll), SecureRandom())
+    return sslContext
+}
+
 // Клиент для работы с T-Invest API (стакан)
 class TcsClient {
     private val http = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(15))
+        .sslContext(createTrustAllSSLContext())
         .build()
     private val parser = XmlParser()
 
@@ -274,6 +292,7 @@ class TcsClient {
 class MoexClient {
     private val http = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(15))
+        .sslContext(createTrustAllSSLContext())
         .build()
     private val parser = XmlParser()
     private val tcsClient = TcsClient()

@@ -5,10 +5,15 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.time.Duration
 import java.time.LocalDate
 import java.time.temporal.ChronoUnit
 import java.util.Properties
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 // Загрузка конфигурации из application.properties
 fun loadProperties(): Properties {
@@ -81,10 +86,23 @@ val RISK_TO_RATING = mapOf(
     "RISK_LEVEL_VERY_HIGH" to "D"
 )
 
+// SSL context, доверяющий всем сертификатам (необходимо для российских CA)
+fun createTrustAllSSLContext(): SSLContext {
+    val trustAll = object : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+        override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
+        override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+    }
+    val sslContext = SSLContext.getInstance("TLS")
+    sslContext.init(null, arrayOf<TrustManager>(trustAll), SecureRandom())
+    return sslContext
+}
+
 // Клиент для DoHod.ru API (аналитика эмитентов)
 class DohodClient {
     private val http = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(15))
+        .sslContext(createTrustAllSSLContext())
         .build()
 
     // Получить качество эмитента и рейтинг
@@ -176,6 +194,7 @@ class DohodClient {
 class TcsBondClient {
     private val http = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(15))
+        .sslContext(createTrustAllSSLContext())
         .build()
 
     // Получить список всех облигаций
