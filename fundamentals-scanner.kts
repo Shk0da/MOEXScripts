@@ -37,6 +37,24 @@ data class Config(
     val showAllFundamentals: Boolean = false
 )
 
+// Очистка названия от юридических префиксов
+fun cleanCompanyName(fullName: String): String {
+    var name = fullName
+    // Удаляем префиксы с акциями (в правильном порядке)
+    name = name.replace(Regex("^Акции\\s+"), "")
+    name = name.replace(Regex("^(обыкновенные|привилегированные)\\s+"), "")
+    name = name.replace(Regex("^типа\\s+[А-ЯA-Z]\\s*"), "")  // типа А или типа A (кириллица и латиница)
+    name = name.replace(Regex("^(ПАО|АО|ОАО|ЗАО|ООО|НАО)\\s*"), "")
+    // Удаляем кавычки
+    name = name.replace("\"", "")
+    // Удаляем скобки в конце
+    name = name.replace(Regex("\\s*\\([^)]*\\)\\s*$"), "")
+    // Удаляем суффиксы
+    name = name.replace(Regex("\\s+-\\s*привилегированные\\s+акции\\s*$"), "")
+    name = name.trim()
+    return name.ifEmpty { fullName }
+}
+
 data class ShareInfo(
     val uid: String,
     val figi: String,
@@ -44,8 +62,12 @@ data class ShareInfo(
     val name: String,
     val currency: String,
     val sector: String,
-    val lot: Int
-)
+    val lot: Int,
+    val forQualInvestorFlag: Boolean = false  // true = только для квалифицированных инвесторов
+) {
+    val forNonQualifiedInvestor: Boolean get() = !forQualInvestorFlag
+    val shortName: String get() = cleanCompanyName(name)
+}
 
 data class AssetMapping(
     val assetUid: String,
@@ -128,7 +150,9 @@ data class RankedStock(
     val beta: Double,
     val undervaluationScore: Double,
     val forecast: Forecast? = null
-)
+) {
+    val shortName: String get() = cleanCompanyName(name)
+}
 
 fun createTrustAllSSLContext(): SSLContext {
     val trustAll = object : X509TrustManager {
@@ -293,8 +317,9 @@ class TcsFundamentalsClient {
             val currency = extractString(item, "currency")
             val sector = extractString(item, "sector")
             val lot = extractInt(item, "lot")
+            val forQualInvestor = extractBool(item, "forQualInvestorFlag")
             if (uid.isNotEmpty()) {
-                shares.add(ShareInfo(uid, figi, ticker, name, currency, sector, lot))
+                shares.add(ShareInfo(uid, figi, ticker, name, currency, sector, lot, forQualInvestor))
             }
         }
         return shares
@@ -603,7 +628,8 @@ fun main(args: Array<String>) {
     // Step 1: Get all shares
     printHeader("Загрузка списка акций...")
     val shares = client.getShares()
-    println("  Найдено акций: ${shares.size}")
+    val forNonQualified = shares.count { !it.forQualInvestorFlag }
+    println("  Найдено акций: ${shares.size} (доступно неквалифицированным: $forNonQualified)")
     val shareMap = shares.associateBy { it.uid }
 
     // Step 2: Get all assets and build mapping
@@ -643,17 +669,21 @@ fun main(args: Array<String>) {
     val withSector = allFundamentals.map { f ->
         val ticker = f.ticker.ifEmpty { assetToTicker[f.assetUid] ?: "" }
         val share = shareMap.values.find { it.ticker == ticker }
+        // Приоритет имён: share.name (Shares API) > assetToName > f.name
+        val name = share?.name ?: assetToName[f.assetUid] ?: f.name
         f.copy(
             ticker = ticker,
-            name = f.name.ifEmpty { assetToName[f.assetUid] ?: "" },
+            name = name,
             sector = share?.sector ?: ""
         )
     }.filter { f ->
+        val share = shareMap.values.find { it.ticker == f.ticker }
         f.marketCap >= config.minMarketCap &&
         f.peRatio > 0 &&
         f.peRatio <= config.maxPE &&
         f.dividendYield >= config.minDividendYield &&
-        (f.debtToEquity == 0.0 || f.debtToEquity <= config.maxDebtToEquity)
+        (f.debtToEquity == 0.0 || f.debtToEquity <= config.maxDebtToEquity) &&
+        !(share?.forQualInvestorFlag ?: true)  // Только для неквалифицированных инвесторов
     }
 
     val ranked = withSector.map { f ->
@@ -684,17 +714,17 @@ fun main(args: Array<String>) {
 
     // Print top N
     val topN = ranked.take(config.topN)
-    println("  №  Тикер      Название                          Сектор           P/E    P/B   EV/EB  D/E   ROE    ROIC   Div%  Рост  Оценка")
-    println("  ── ───────── ───────────────────────────────── ──────────────── ────── ───── ───── ───── ───── ────── ────── ───── ──────")
+    println("  №  Тикер     Название                       Сектор           P/E    P/B   EV/EB  D/E   ROE    ROIC   Div%  Рост  Оценка")
+    println("  ── ───────── ────────────────────────────── ─────────────── ────── ───── ───── ───── ───── ────── ────── ───── ──────")
     topN.forEachIndexed { i, s ->
         val tickerPad = s.ticker.padEnd(9).take(9)
-        val namePad = s.name.take(31).padEnd(31)
+        val nameDisplay = s.shortName.let { if (it.length > 30) it.take(27) + "..." else it }.padEnd(30)
         val sectorPad = s.sector.take(15).padEnd(15)
-        println("  %2d  %s %s %s %6s %5s %5s %5s %5s %6s %6s %5s %6s"
+        println("  %2d  %-9s %-30s %-15s %6s %5s %5s %5s %5s %6s %6s %5s %6s"
             .format(
                 i + 1,
                 tickerPad,
-                namePad,
+                nameDisplay,
                 sectorPad,
                 formatDouble(s.pe).padStart(6),
                 formatDouble(s.pb).padStart(5),
@@ -720,7 +750,7 @@ fun main(args: Array<String>) {
         if (forecast != null) {
             forecastCount++
 
-            println("\n  [${stock.ticker}] ${stock.name}")
+            println("\n  [${stock.ticker}] ${stock.shortName}")
             println("  ├─ Консенсус:  ${forecast.consensusTarget.let { formatDouble(it) }}")
             println("  ├─ Диапазон:   ${formatDouble(forecast.minTarget)} – ${formatDouble(forecast.maxTarget)}")
             println("  ├─ Текущая:    ${formatDouble(forecast.currentPrice)}")
@@ -753,7 +783,7 @@ fun main(args: Array<String>) {
     println("  Dividend Yield (×1), ROE (×1), D/E (×1). Максимум — 100 баллов.\n")
 
     topN.forEachIndexed { i, s ->
-        println("  ${i + 1}. ${s.ticker} (${s.name}) — ${"%.0f".format(s.undervaluationScore)} баллов")
+        println("  ${i + 1}. ${s.ticker} (${s.shortName}) — ${"%.0f".format(s.undervaluationScore)} баллов")
         println("     P/E: ${formatDouble(s.pe)} | P/B: ${formatDouble(s.pb)} | P/S: ${formatDouble(s.ps)} | EV/EBITDA: ${formatDouble(s.evEbitda)}")
         println("     D/E: ${formatDouble(s.de)} | ROE: ${formatPct(s.roe)} | ROIC: ${formatPct(s.roic)} | Див.: ${formatPct(s.divYield)}")
         println("     Рост выручки (5л): ${formatPct(s.revenueGrowth5y)} | Маржа: ${formatPct(s.netMargin)} | Beta: ${formatDouble(s.beta)}")
