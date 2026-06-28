@@ -67,6 +67,22 @@ data class BondData(
     val commission: Double,      // Комиссия брокера
     val netProfit: Double,       // Чистая прибыль
     val netYield: Double,        // Чистая доходность
+    val assetUid: String = "",
+    val financialScore: Int = 0,       // 0 = н/д, 1-5
+    val financialScoreLabel: String = "",
+    val fundamentals: IssuerFundamentals? = null
+)
+
+data class IssuerFundamentals(
+    val name: String,
+    val debtToEquity: Double,
+    val netDebtToEbitda: Double,
+    val currentRatio: Double,
+    val roe: Double,
+    val roic: Double,
+    val netMargin: Double,
+    val revenueGrowth5y: Double,
+    val marketCap: Double
 )
 
 // Рейтинг облигаций (от лучшего к худшему)
@@ -102,6 +118,130 @@ fun formatAcceptedRisk(maxRiskLevel: String): String {
         .filter { it.value <= maxValue }
         .sortedBy { it.value }
         .joinToString(", ") { RISK_TO_RATING[it.key] ?: it.key }
+}
+
+val FINANCIAL_SCORE_LABELS = mapOf(
+    1 to "плохо",
+    2 to "слабо",
+    3 to "средне",
+    4 to "хорошо",
+    5 to "отлично"
+)
+
+fun financialScoreLabel(score: Int): String =
+    if (score in 1..5) FINANCIAL_SCORE_LABELS[score]!! else "н/д"
+
+fun calculateFinancialHealthScore(f: IssuerFundamentals): Int {
+    var score = 0.0
+    var weight = 0.0
+
+    fun add(metricScore: Double, w: Double) {
+        score += metricScore * w
+        weight += w
+    }
+
+    if (f.debtToEquity in 0.01..500.0) {
+        val s = when {
+            f.debtToEquity <= 30 -> 100.0
+            f.debtToEquity <= 50 -> 80.0
+            f.debtToEquity <= 100 -> 60.0
+            f.debtToEquity <= 200 -> 40.0
+            f.debtToEquity <= 300 -> 20.0
+            else -> 10.0
+        }
+        add(s, 2.0)
+    }
+    if (f.netDebtToEbitda in 0.01..50.0) {
+        val s = when {
+            f.netDebtToEbitda <= 1 -> 100.0
+            f.netDebtToEbitda <= 2 -> 80.0
+            f.netDebtToEbitda <= 3 -> 60.0
+            f.netDebtToEbitda <= 5 -> 40.0
+            f.netDebtToEbitda <= 8 -> 20.0
+            else -> 10.0
+        }
+        add(s, 2.0)
+    }
+    if (f.currentRatio in 0.01..20.0) {
+        val s = when {
+            f.currentRatio >= 2 -> 100.0
+            f.currentRatio >= 1.5 -> 80.0
+            f.currentRatio >= 1.2 -> 60.0
+            f.currentRatio >= 1.0 -> 40.0
+            f.currentRatio >= 0.8 -> 20.0
+            else -> 10.0
+        }
+        add(s, 1.5)
+    }
+    if (f.roe in 0.01..100.0) {
+        val s = when {
+            f.roe >= 20 -> 100.0
+            f.roe >= 15 -> 80.0
+            f.roe >= 10 -> 60.0
+            f.roe >= 5 -> 40.0
+            else -> 20.0
+        }
+        add(s, 1.0)
+    }
+    if (f.roic in 0.01..100.0) {
+        val s = when {
+            f.roic >= 15 -> 100.0
+            f.roic >= 10 -> 80.0
+            f.roic >= 7 -> 60.0
+            f.roic >= 4 -> 40.0
+            else -> 20.0
+        }
+        add(s, 1.0)
+    }
+    if (f.netMargin in 0.01..100.0) {
+        val s = when {
+            f.netMargin >= 20 -> 100.0
+            f.netMargin >= 15 -> 80.0
+            f.netMargin >= 10 -> 60.0
+            f.netMargin >= 5 -> 40.0
+            else -> 20.0
+        }
+        add(s, 1.0)
+    }
+    if (f.revenueGrowth5y > 0) {
+        val s = when {
+            f.revenueGrowth5y >= 15 -> 100.0
+            f.revenueGrowth5y >= 10 -> 80.0
+            f.revenueGrowth5y >= 5 -> 60.0
+            f.revenueGrowth5y >= 2 -> 40.0
+            else -> 20.0
+        }
+        add(s, 0.5)
+    }
+
+    if (weight <= 0) return 0
+    val avg = score / weight
+    return when {
+        avg < 20 -> 1
+        avg < 40 -> 2
+        avg < 60 -> 3
+        avg < 80 -> 4
+        else -> 5
+    }
+}
+
+fun findIssuerAssetUid(bondName: String, shareAssets: List<TcsBondClient.ShareAssetRef>): String {
+    val normalizedBond = bondName
+        .replace(Regex("""\s+\d+Р?-\d+.*$"""), "")
+        .replace(Regex("""\s+БО-.*$"""), "")
+        .replace(Regex("""\s+облигаци.*$""", RegexOption.IGNORE_CASE), "")
+        .trim()
+    if (normalizedBond.length < 3) return ""
+
+    shareAssets
+        .sortedByDescending { it.name.length }
+        .forEach { asset ->
+            if (normalizedBond.contains(asset.name, ignoreCase = true) ||
+                asset.name.contains(normalizedBond, ignoreCase = true)) {
+                return asset.assetUid
+            }
+        }
+    return ""
 }
 
 // SSL context, доверяющий всем сертификатам (необходимо для российских CA)
@@ -222,6 +362,7 @@ class TcsBondClient {
         val name: String,
         val figi: String,
         val classCode: String,
+        val assetUid: String,
         val couponQuantityPerYear: Int,
         val maturityDate: String,
         val nominal: Double,
@@ -230,6 +371,12 @@ class TcsBondClient {
         val amortizationFlag: Boolean,
         val floatingCouponFlag: Boolean,
         val forQualInvestorFlag: Boolean
+    )
+
+    data class ShareAssetRef(
+        val assetUid: String,
+        val name: String,
+        val ticker: String
     )
 
     data class CouponEvent(
@@ -297,6 +444,7 @@ class TcsBondClient {
             name = extractString(json, "name"),
             figi = extractString(json, "figi"),
             classCode = extractString(json, "classCode"),
+            assetUid = extractString(json, "assetUid"),
             couponQuantityPerYear = extractInt(json, "couponQuantityPerYear"),
             maturityDate = extractString(json, "maturityDate").substringBefore("T"),
             nominal = extractNominal(json),
@@ -496,6 +644,127 @@ class TcsBondClient {
         
         return units + nano / 1_000_000_000.0
     }
+
+    private fun extractDouble(json: String, key: String): Double {
+        val pattern = "\"$key\"\\s*:\\s*([0-9.]+(?:[eE][+-]?\\d+)?)"
+        val match = Regex(pattern).find(json)
+        return match?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
+    }
+
+    private fun postJson(url: String, body: String, retries: Int = 3): String {
+        for (attempt in 1..retries) {
+            try {
+                val resp = http.send(
+                    HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .header("Authorization", "Bearer $tcsApiKey")
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(body))
+                        .build(),
+                    HttpResponse.BodyHandlers.ofString()
+                )
+                if (resp.statusCode() == 429) {
+                    Thread.sleep(5000L)
+                    continue
+                }
+                if (resp.statusCode() != 200) {
+                    throw Exception("HTTP ${resp.statusCode()}")
+                }
+                return resp.body()
+            } catch (e: Exception) {
+                if (attempt == retries) throw e
+                Thread.sleep(3000L)
+            }
+        }
+        throw Exception("TCS API: все попытки исчерпаны")
+    }
+
+    private fun extractNestedArray(json: String, key: String): List<String> {
+        val idx = json.indexOf("\"$key\"")
+        if (idx < 0) return emptyList()
+        val rest = json.substring(idx)
+        val start = rest.indexOf('[')
+        if (start < 0) return emptyList()
+        var depth = 0
+        var inStr = false
+        val items = mutableListOf<String>()
+        var itemStart = -1
+        for (i in start + 1 until rest.length) {
+            val c = rest[i]
+            if (c == '"') inStr = !inStr
+            if (inStr) continue
+            when (c) {
+                '[' -> depth++
+                ']' -> {
+                    depth--
+                    if (depth < 0) break
+                }
+                '{' -> {
+                    if (depth == 0 && itemStart < 0) itemStart = i
+                    depth++
+                }
+                '}' -> {
+                    depth--
+                    if (depth == 0 && itemStart >= 0) {
+                        items.add(rest.substring(itemStart, i + 1))
+                        itemStart = -1
+                    }
+                }
+            }
+        }
+        return items
+    }
+
+    fun getShareAssets(): List<ShareAssetRef> {
+        return try {
+            val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetAssets"
+            val resp = postJson(url, """{"instrumentType":"INSTRUMENT_TYPE_SHARE"}""")
+            val assets = extractNestedArray(resp, "assets")
+            val refs = mutableListOf<ShareAssetRef>()
+            for (asset in assets) {
+                val assetUid = extractString(asset, "uid")
+                val assetName = extractString(asset, "name")
+                if (assetUid.isEmpty()) continue
+                val instruments = extractNestedArray(asset, "instruments")
+                val ticker = instruments.firstOrNull()?.let { extractString(it, "ticker") } ?: ""
+                refs.add(ShareAssetRef(assetUid, assetName, ticker))
+            }
+            refs
+        } catch (e: Exception) {
+            println("  [WARN] GetAssets: ${e.message}")
+            emptyList()
+        }
+    }
+
+    fun getAssetFundamentals(assetIds: List<String>): Map<String, IssuerFundamentals> {
+        if (assetIds.isEmpty()) return emptyMap()
+        val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetAssetFundamentals"
+        val result = mutableMapOf<String, IssuerFundamentals>()
+        assetIds.chunked(100).forEach { chunk ->
+            try {
+                val idsJson = chunk.joinToString(",") { "\"$it\"" }
+                val resp = postJson(url, """{"assets":[$idsJson]}""")
+                for (item in extractNestedArray(resp, "fundamentals")) {
+                    val assetUid = extractString(item, "assetUid")
+                    if (assetUid.isEmpty()) continue
+                    result[assetUid] = IssuerFundamentals(
+                        name = extractString(item, "name"),
+                        debtToEquity = extractDouble(item, "totalDebtToEquityMrq"),
+                        netDebtToEbitda = extractDouble(item, "netDebtToEbitda"),
+                        currentRatio = extractDouble(item, "currentRatioMrq"),
+                        roe = extractDouble(item, "roe"),
+                        roic = extractDouble(item, "roic"),
+                        netMargin = extractDouble(item, "netMarginMrq"),
+                        revenueGrowth5y = extractDouble(item, "fiveYearAnnualRevenueGrowthRate"),
+                        marketCap = extractDouble(item, "marketCapitalization")
+                    )
+                }
+            } catch (e: Exception) {
+                println("  [WARN] GetAssetFundamentals: ${e.message}")
+            }
+        }
+        return result
+    }
 }
 
 // Сканер облигаций
@@ -611,7 +880,8 @@ class BondScanner {
                 totalProfit = totalCouponIncome + priceDiff,
                 commission = priceInRubles * config.brokerCommission,
                 netProfit = totalCouponIncome + priceDiff - (priceInRubles * config.brokerCommission),
-                netYield = ((totalCouponIncome + priceDiff - (priceInRubles * config.brokerCommission)) / priceInRubles / yearsToMaturity * 100)
+                netYield = ((totalCouponIncome + priceDiff - (priceInRubles * config.brokerCommission)) / priceInRubles / yearsToMaturity * 100),
+                assetUid = bond.assetUid
             )
         }
 
@@ -624,9 +894,66 @@ class BondScanner {
 
         val sortMode = if (config.excludeFloating) "YTM" else "купон"
         println("  Отобрано: ${sorted.size} (сортировка по $sortMode)")
+
+        println("  Фундаментальный анализ эмитентов...")
+        val enriched = enrichWithFundamentals(sorted)
+
+        val withScore = enriched.count { it.financialScore > 0 }
+        println("  Оценка эмитентов: $withScore/${enriched.size}")
         println()
 
-        return sorted
+        return enriched
+    }
+
+    private fun enrichWithFundamentals(bonds: List<BondData>): List<BondData> {
+        if (bonds.isEmpty()) return bonds
+
+        val shareAssets = client.getShareAssets()
+        val resolvedUids = bonds.associate { bond ->
+            bond.ticker to resolveAssetUid(bond, shareAssets)
+        }
+
+        var fundamentals = client.getAssetFundamentals(resolvedUids.values.filter { it.isNotEmpty() }.distinct())
+
+        // Повторный поиск по акциям, если по assetUid облигации нет данных
+        val missing = bonds.filter { fundamentals[resolvedUids[it.ticker]] == null }
+        if (missing.isNotEmpty() && shareAssets.isNotEmpty()) {
+            val fallbackUids = missing.mapNotNull { bond ->
+                val fallback = findIssuerAssetUid(bond.name, shareAssets)
+                if (fallback.isNotEmpty() && fallback != resolvedUids[bond.ticker]) bond.ticker to fallback else null
+            }.toMap()
+            if (fallbackUids.isNotEmpty()) {
+                val extra = client.getAssetFundamentals(fallbackUids.values.distinct())
+                fundamentals = fundamentals + extra
+                return bonds.map { bond ->
+                    val primaryUid = resolvedUids[bond.ticker] ?: ""
+                    val assetUid = fallbackUids[bond.ticker] ?: primaryUid
+                    val fund = fundamentals[assetUid] ?: fundamentals[primaryUid]
+                    toBondWithFundamentals(bond, assetUid, fund)
+                }
+            }
+        }
+
+        return bonds.map { bond ->
+            val assetUid = resolvedUids[bond.ticker] ?: ""
+            toBondWithFundamentals(bond, assetUid, fundamentals[assetUid])
+        }
+    }
+
+    private fun toBondWithFundamentals(bond: BondData, assetUid: String, fund: IssuerFundamentals?): BondData {
+        if (fund == null) return bond.copy(assetUid = assetUid)
+        val score = calculateFinancialHealthScore(fund)
+        return bond.copy(
+            assetUid = assetUid,
+            financialScore = score,
+            financialScoreLabel = financialScoreLabel(score),
+            fundamentals = fund
+        )
+    }
+
+    private fun resolveAssetUid(bond: BondData, shareAssets: List<TcsBondClient.ShareAssetRef>): String {
+        if (bond.assetUid.isNotEmpty()) return bond.assetUid
+        return findIssuerAssetUid(bond.name, shareAssets)
     }
 
     private fun isRiskLevelAcceptable(riskLevel: String, minRiskLevel: String): Boolean {
@@ -658,8 +985,8 @@ fun printResults(bonds: List<BondData>, config: BondConfig) {
     }
 
     println()
-    println("#    | Тикер        | Название                  |  Цена  |  Купон   | Купон% |  YTM%  | Дней  |    Риск    |    Сектор")
-    println("---------------------------------------------------------------------------------------------------------------------------------------")
+    println("#    | Тикер        | Название                  |  Цена  |  Купон   | Купон% |  YTM%  | Дней  |    Риск    |  Фин.  |    Сектор")
+    println("--------------------------------------------------------------------------------------------------------------------------------------------------")
     
     bonds.forEachIndexed { index, bond ->
         val sectorShort = when (bond.sector) {
@@ -677,8 +1004,13 @@ fun printResults(bonds: List<BondData>, config: BondConfig) {
         }.take(12)
         
         val riskDisplay = RISK_TO_RATING[bond.riskLevel] ?: bond.riskLevel.removePrefix("RISK_LEVEL_")
+        val finDisplay = if (bond.financialScore > 0) {
+            "${bond.financialScore} ${bond.financialScoreLabel.take(4)}"
+        } else {
+            "н/д"
+        }
         
-        println("%-4d | %-12s | %-25s | %5.2f%% | %6.2f руб | %5.1f%% | %5.1f%% | %5d  | %-10s | %-12s".format(
+        println("%-4d | %-12s | %-25s | %5.2f%% | %6.2f руб | %5.1f%% | %5.1f%% | %5d  | %-10s | %-6s | %-12s".format(
             index + 1,
             bond.ticker,
             bond.name.take(25),
@@ -688,13 +1020,38 @@ fun printResults(bonds: List<BondData>, config: BondConfig) {
             bond.ytm,
             bond.daysToMaturity,
             riskDisplay,
+            finDisplay,
             sectorShort
         ))
     }
     
-    println("---------------------------------------------------------------------------------------------------------------------------------------")
+    println("--------------------------------------------------------------------------------------------------------------------------------------------------")
     println()
-    println("  Примечание: риск — уровень T-Invest (${formatAcceptedRisk(config.minRiskLevel)})")
+    println("  Примечание: риск — T-Invest (${formatAcceptedRisk(config.minRiskLevel)}); фин. — оценка эмитента 1-5 (плохо → отлично)")
+
+    val bondsWithFundamentals = bonds.filter { it.fundamentals != null }
+    if (bondsWithFundamentals.isNotEmpty()) {
+        println()
+        println("  Фундаментальный анализ эмитентов (топ-${bonds.size}):")
+        bondsWithFundamentals.forEach { bond ->
+            val f = bond.fundamentals!!
+            println()
+            println("  ${bond.ticker} — ${bond.financialScore}/5 (${bond.financialScoreLabel})")
+            if (f.name.isNotEmpty()) println("    Эмитент: ${f.name}")
+            val metrics = listOfNotNull(
+                if (f.debtToEquity > 0) "D/E: %.1f%%".format(f.debtToEquity) else null,
+                if (f.netDebtToEbitda > 0) "NetDebt/EBITDA: %.2f".format(f.netDebtToEbitda) else null,
+                if (f.currentRatio > 0) "Тек.ликв: %.2f".format(f.currentRatio) else null,
+                if (f.roe > 0) "ROE: %.1f%%".format(f.roe) else null,
+                if (f.roic > 0) "ROIC: %.1f%%".format(f.roic) else null,
+                if (f.netMargin > 0) "Маржа: %.1f%%".format(f.netMargin) else null,
+                if (f.revenueGrowth5y > 0) "Рост выручки 5л: %.1f%%".format(f.revenueGrowth5y) else null
+            )
+            if (metrics.isNotEmpty()) {
+                println("    ${metrics.joinToString(" | ")}")
+            }
+        }
+    }
     
     // Итоговая статистика
     val avgYtm = bonds.map { it.ytm }.average()
@@ -708,6 +1065,11 @@ fun printResults(bonds: List<BondData>, config: BondConfig) {
         println("    Средняя YTM: %.2f%%".format(avgYtm))
     } else {
         println("    Средний купон: %.2f руб".format(avgCoupon))
+    }
+    val scored = bonds.filter { it.financialScore > 0 }
+    if (scored.isNotEmpty()) {
+        val avgFin = scored.map { it.financialScore }.average()
+        println("    Средняя оценка эмитентов: %.1f/5".format(avgFin))
     }
     println("    Средний срок: $avgDays дн.")
     println("    Суммарные купоны (на 1 облиг): %.2f руб".format(totalCoupons / bonds.size))
@@ -770,11 +1132,11 @@ fun parseArgs(args: Array<String>): BondConfig {
                 noAmort = false
                 i++
             }
-            args[i] == "--allow-floating" -> {
+            args[i] == "--allow-floating" || args[i] == "-f" -> {
                 excludeFloating = false
                 i++
             }
-            args[i] == "--allow-qual" -> {
+            args[i] == "--allow-qual" || args[i] == "-q" -> {
                 excludeQualOnly = false
                 i++
             }
@@ -804,8 +1166,8 @@ fun parseArgs(args: Array<String>): BondConfig {
                 println("  --yield <value>          Целевая доходность (по умолчанию: 16.0)")
                 println("  --coupon-freq <value>    Частота купона в год (по умолчанию: 12)")
                 println("  --allow-amortization     Разрешить амортизацию (по умолчанию: false)")
-                println("  --allow-floating         Разрешить флоатеры (по умолчанию: false)")
-                println("  --allow-qual             Разрешить бумаги для квал. инвесторов (по умолчанию: false)")
+                println("  --allow-floating, -f     Разрешить флоатеры (по умолчанию: false)")
+                println("  --allow-qual, -q         Разрешить бумаги для квал. инвесторов (по умолчанию: false)")
                 println("  --min-risk <level>       Макс. риск: AAA (только надежные), MODERATE (надежные+средние, по умолчанию)")
                 println("  --count <value>          Кол-во облигаций в топе (по умолчанию: 10)")
                 println("  --capital <value>        Капитал для инвестиций (по умолчанию: 100000)")
