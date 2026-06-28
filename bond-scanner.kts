@@ -35,7 +35,9 @@ data class BondConfig(
     val targetYield: Double = 16.0,  // Целевая доходность, % годовых
     val couponFrequency: Int = 12,   // Частота купона (12 = ежемесячно)
     val noAmortization: Boolean = true,  // Без амортизации
-    val minRiskLevel: String = "RISK_LEVEL_LOW",  // Минимальный рейтинг
+    val excludeFloating: Boolean = true,  // Исключить флоатеры
+    val excludeQualInvestorOnly: Boolean = true,  // Исключить бумаги только для квал. инвесторов
+    val minRiskLevel: String = "RISK_LEVEL_MODERATE",  // Макс. риск: надежные + средние
     val maxBondsCount: Int = 10,     // Топ-N облигаций
     val brokerCommission: Double = 0.0005,  // 0.05% комиссия брокера
     val capital: Double = 100_000.0,  // Капитал для инвестиций
@@ -51,7 +53,7 @@ data class BondData(
     val classCode: String,
     val price: Double,           // Текущая цена (% от номинала)
     val nominal: Double,         // Номинал
-    val couponAmount: Double,    // Купон на 1 облигацию (из DoHod)
+    val couponAmount: Double,    // Купон на 1 облигацию (из TCS API)
     val couponFrequency: Int,    // Купонов в год
     val maturityDate: LocalDate, // Дата погашения
     val daysToMaturity: Int,     // Дней до погашения
@@ -65,9 +67,6 @@ data class BondData(
     val commission: Double,      // Комиссия брокера
     val netProfit: Double,       // Чистая прибыль
     val netYield: Double,        // Чистая доходность
-    val dohodQuality: Double = 0.0,  // Качество эмитента по DoHod (0-10)
-    val dohodRating: String = "",    // Рейтинг DoHod
-    val dohodCoupon: Double = 0.0    // Купон из DoHod (рубли)
 )
 
 // Рейтинг облигаций (от лучшего к худшему)
@@ -78,13 +77,32 @@ val RISK_LEVELS = mapOf(
     "RISK_LEVEL_VERY_HIGH" to 4
 )
 
-// Маппинг на буквенные рейтинги
+// Маппинг уровня риска T-Invest на рейтинговую шкалу
 val RISK_TO_RATING = mapOf(
-    "RISK_LEVEL_LOW" to "AAA-BBB",
-    "RISK_LEVEL_MODERATE" to "BB-B",
-    "RISK_LEVEL_HIGH" to "CCC и ниже",
+    "RISK_LEVEL_LOW" to "AAA",
+    "RISK_LEVEL_MODERATE" to "AA-BB",
+    "RISK_LEVEL_HIGH" to "B-CCC",
     "RISK_LEVEL_VERY_HIGH" to "D"
 )
+
+val RISK_LEVEL_ALIASES = mapOf(
+    "AAA" to "RISK_LEVEL_LOW",
+    "LOW" to "RISK_LEVEL_LOW",
+    "MODERATE" to "RISK_LEVEL_MODERATE",
+    "HIGH" to "RISK_LEVEL_HIGH",
+    "VERY_HIGH" to "RISK_LEVEL_VERY_HIGH"
+)
+
+fun normalizeRiskLevel(level: String): String =
+    RISK_LEVEL_ALIASES[level.uppercase()] ?: level
+
+fun formatAcceptedRisk(maxRiskLevel: String): String {
+    val maxValue = RISK_LEVELS[maxRiskLevel] ?: return maxRiskLevel
+    return RISK_LEVELS.entries
+        .filter { it.value <= maxValue }
+        .sortedBy { it.value }
+        .joinToString(", ") { RISK_TO_RATING[it.key] ?: it.key }
+}
 
 // SSL context, доверяющий всем сертификатам (необходимо для российских CA)
 fun createTrustAllSSLContext(): SSLContext {
@@ -96,99 +114,6 @@ fun createTrustAllSSLContext(): SSLContext {
     val sslContext = SSLContext.getInstance("TLS")
     sslContext.init(null, arrayOf<TrustManager>(trustAll), SecureRandom())
     return sslContext
-}
-
-// Клиент для DoHod.ru API (аналитика эмитентов)
-class DohodClient {
-    private val http = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(15))
-        .sslContext(createTrustAllSSLContext())
-        .build()
-
-    // Получить качество эмитента и рейтинг
-    fun getIssuerQuality(isin: String): IssuerQuality? {
-        return try {
-            val url = "https://analytics.dohod.ru/bond/$isin"
-            val resp = http.send(
-                HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .header("User-Agent", "Mozilla/5.0")
-                    .GET()
-                    .build(),
-                HttpResponse.BodyHandlers.ofString()
-            )
-            
-            if (resp.statusCode() != 200) {
-                return null
-            }
-            
-            parseDohodHtml(resp.body(), isin)
-        } catch (e: Exception) {
-            println("  [WARN] DoHod ошибка для $isin: ${e.message}")
-            null
-        }
-    }
-
-    data class IssuerQuality(
-        val quality: Double,      // Качество эмитента (0-10)
-        val rating: String,       // Кредитный рейтинг (AAA, BB, и т.д.)
-        val liquidity: Double,    // Ликвидность (0-100)
-        val coupon: Double = 0.0  // Размер купона в рублях
-    )
-
-    private fun parseDohodHtml(html: String, isin: String): IssuerQuality? {
-        // Ищем все доступные рейтинги с приоритетами
-        // 1. Внутренний рейтинг ДОХОДЪ
-        // 2. АКРА
-        // 3. Эксперт РА
-        // 4. НКР
-        // 5. Другие агентства
-        
-        var rating = ""
-        var quality = 0.0
-        
-        // Паттерны для разных источников рейтингов (в порядке приоритета)
-        val ratingPatterns = listOf(
-            // Внутренний рейтинг ДОХОДЪ: "BB (6 из 10)"
-            Regex("""Внутренний рейтинг ДОХОДЪ\s*</p>[^<]*<[^>]*>\s*([A-Z+-]+)\s*\(\s*(\d+)\s*из\s*(\d+)"""),
-            // АКРА: "АКРА - A-(RU) (6 из 10)"
-            Regex("""АКРА\s*-\s*([A-Z+-]+(?:\s*\(RU\))?)\s*\(\s*(\d+)\s*из\s*(\d+)"""),
-            // Эксперт РА
-            Regex("""Эксперт\s*РА\s*-\s*([A-Z+-]+)\s*\(\s*(\d+)\s*из\s*(\d+)"""),
-            // НКР
-            Regex("""НКР\s*-\s*([A-Z+-]+)\s*\(\s*(\d+)\s*из\s*(\d+)"""),
-            // Общий паттерн: "A (6 из 10)" или "BBB (5 из 10)"
-            Regex("""([A-Z+-]{2,3})\s*\(\s*(\d+)\s*из\s*(\d+)""")
-        )
-        
-        for (pattern in ratingPatterns) {
-            val match = pattern.find(html)
-            if (match != null) {
-                rating = match.groupValues[1].replace("(RU)", "").trim()
-                quality = match.groupValues[2].toDoubleOrNull() ?: 0.0
-                val maxQuality = match.groupValues[3].toDoubleOrNull() ?: 10.0
-                // Нормализуем к шкале 0-10
-                quality = if (maxQuality > 0) quality * 10 / maxQuality else 0.0
-                break  // Берем первый найденный (наивысший приоритет)
-            }
-        }
-        
-        // Ликвидность ищем отдельно
-        val liquidityPattern = Regex("""Коэф\.\s*ликвидности\s*([0-9.]+)\s*из\s*100""")
-        val liquidityMatch = liquidityPattern.find(html)
-        val liquidity = liquidityMatch?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
-        
-        // Купон ищем в формате "35.40 RUB" или "Купон 35.40"
-        val couponPattern = Regex("""Купон[^0-9]*([0-9.]+)\s*RUB""")
-        val couponMatch = couponPattern.find(html)
-        val coupon = couponMatch?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
-        
-        if (rating.isEmpty() && quality <= 0) {
-            return null
-        }
-
-        return IssuerQuality(quality, rating, liquidity, coupon)
-    }
 }
 
 class TcsBondClient {
@@ -302,7 +227,9 @@ class TcsBondClient {
         val nominal: Double,
         val riskLevel: String,
         val sector: String,
-        val amortizationFlag: Boolean
+        val amortizationFlag: Boolean,
+        val floatingCouponFlag: Boolean,
+        val forQualInvestorFlag: Boolean
     )
 
     data class CouponEvent(
@@ -375,7 +302,9 @@ class TcsBondClient {
             nominal = extractNominal(json),
             riskLevel = extractString(json, "riskLevel").ifEmpty { "RISK_LEVEL_UNSPECIFIED" },
             sector = extractString(json, "sector"),
-            amortizationFlag = extractBoolean(json, "amortizationFlag")
+            amortizationFlag = extractBoolean(json, "amortizationFlag"),
+            floatingCouponFlag = extractBoolean(json, "floatingCouponFlag"),
+            forQualInvestorFlag = extractBoolean(json, "forQualInvestorFlag")
         )
     }
 
@@ -572,7 +501,6 @@ class TcsBondClient {
 // Сканер облигаций
 class BondScanner {
     private val client = TcsBondClient()
-    private val dohodClient = DohodClient()
 
     fun scan(config: BondConfig): List<BondData> {
         println("=== Сканер облигаций ===")
@@ -580,7 +508,9 @@ class BondScanner {
         println("    Целевая доходность: ${config.targetYield}%")
         println("    Частота купона: ${config.couponFrequency}/год")
         println("    Без амортизации: ${config.noAmortization}")
-        println("    Мин. рейтинг: ${RISK_TO_RATING[config.minRiskLevel] ?: config.minRiskLevel}")
+        println("    Без флоатеров: ${config.excludeFloating}")
+        println("    Без бумаг для квал. инвесторов: ${config.excludeQualInvestorOnly}")
+        println("    Риск (T-Invest): ${formatAcceptedRisk(config.minRiskLevel)}")
         println("    Срок до погашения: ${config.minDaysToMaturity}-${config.maxDaysToMaturity} дн.")
         println()
 
@@ -589,10 +519,16 @@ class BondScanner {
         val allBonds = client.getAllBonds()
         println("  Найдено: ${allBonds.size}")
 
+        val forNonQual = allBonds.count { !it.forQualInvestorFlag }
+        val nonFloating = allBonds.count { !it.floatingCouponFlag }
+        println("  Доступно неквалифицированным: $forNonQual, без флоатеров: $nonFloating")
+
         // Фильтрация по критериям
         val filtered = allBonds.filter { bond ->
             bond.couponQuantityPerYear == config.couponFrequency &&
             (!config.noAmortization || !bond.amortizationFlag) &&
+            (!config.excludeFloating || !bond.floatingCouponFlag) &&
+            (!config.excludeQualInvestorOnly || !bond.forQualInvestorFlag) &&
             isRiskLevelAcceptable(bond.riskLevel, config.minRiskLevel) &&
             bond.sector != "government"  // Исключаем гособлигации (низкая доходность)
         }
@@ -603,12 +539,6 @@ class BondScanner {
         val instrumentIds = filtered.map { "${it.ticker}_${it.classCode}" }
         val prices = client.getLastPrices(instrumentIds)
 
-        // Получение данных DoHod (качество эмитента)
-        println("  Получение данных DoHod.ru...")
-        val dohodData = filtered.associateWith { bond ->
-            dohodClient.getIssuerQuality(bond.ticker)
-        }
-
         // Расчет доходностей
         val bondsWithData = filtered.mapNotNull { bond ->
             val price = prices[bond.ticker]
@@ -617,29 +547,27 @@ class BondScanner {
                 return@mapNotNull null
             }
 
-            // Данные DoHod
-            val dohod = dohodData[bond]
-            val dohodQuality = dohod?.quality ?: 0.0
-            val dohodRating = dohod?.rating ?: ""
-            val dohodCoupon = dohod?.coupon ?: 0.0
+            val coupons = client.getBondCoupons(bond.figi)
+            val futureCoupons = coupons.filter {
+                it.couponDate > LocalDate.now().toString() &&
+                it.currency == "rub" &&
+                isAcceptableCouponType(it.couponType, config.excludeFloating)
+            }.take(config.couponFrequency * 2)
 
-            // Используем купон из DoHod (если есть), иначе из API
-            val avgCoupon = if (dohodCoupon > 0) {
-                dohodCoupon
-            } else {
-                // Получение купонов из API
-                val coupons = client.getBondCoupons(bond.figi)
-                val futureCoupons = coupons.filter { 
-                    it.couponDate > LocalDate.now().toString() &&
-                    it.currency == "rub" &&
-                    (it.couponType == "COUPON_TYPE_FIX" || it.couponType == "COUPON_TYPE_FIXED")
-                }.take(config.couponFrequency * 2)
-                
-                if (futureCoupons.isNotEmpty()) {
+            if (config.excludeFloating && futureCoupons.isEmpty() && coupons.any {
+                it.couponDate > LocalDate.now().toString() && isFloatingCouponType(it.couponType)
+            }) {
+                return@mapNotNull null
+            }
+
+            val avgCoupon = if (futureCoupons.isNotEmpty()) {
+                if (config.excludeFloating) {
                     futureCoupons.map { it.payOneBond }.average()
                 } else {
-                    bond.nominal * 0.12 / config.couponFrequency
+                    futureCoupons.minByOrNull { it.couponDate }!!.payOneBond
                 }
+            } else {
+                bond.nominal * 0.12 / config.couponFrequency
             }
 
             val maturityDate = LocalDate.parse(bond.maturityDate)
@@ -683,17 +611,19 @@ class BondScanner {
                 totalProfit = totalCouponIncome + priceDiff,
                 commission = priceInRubles * config.brokerCommission,
                 netProfit = totalCouponIncome + priceDiff - (priceInRubles * config.brokerCommission),
-                netYield = ((totalCouponIncome + priceDiff - (priceInRubles * config.brokerCommission)) / priceInRubles / yearsToMaturity * 100),
-                dohodQuality = dohodQuality,
-                dohodRating = dohodRating,
-                dohodCoupon = dohodCoupon
+                netYield = ((totalCouponIncome + priceDiff - (priceInRubles * config.brokerCommission)) / priceInRubles / yearsToMaturity * 100)
             )
         }
 
-        // Сортировка по доходности к погашению
-        val sorted = bondsWithData.sortedByDescending { it.ytm }.take(config.maxBondsCount)
+        // Сортировка: фиксированный купон — по YTM, флоатеры — по размеру купона
+        val sorted = if (config.excludeFloating) {
+            bondsWithData.sortedByDescending { it.ytm }
+        } else {
+            bondsWithData.sortedByDescending { it.couponAmount }
+        }.take(config.maxBondsCount)
 
-        println("  Отобрано: ${sorted.size}")
+        val sortMode = if (config.excludeFloating) "YTM" else "купон"
+        println("  Отобрано: ${sorted.size} (сортировка по $sortMode)")
         println()
 
         return sorted
@@ -704,12 +634,22 @@ class BondScanner {
         val minRiskValue = RISK_LEVELS[minRiskLevel] ?: Int.MAX_VALUE
         return riskValue <= minRiskValue
     }
+
+    private fun isFixedCouponType(couponType: String): Boolean =
+        couponType in setOf("COUPON_TYPE_FIX", "COUPON_TYPE_FIXED", "COUPON_TYPE_CONSTANT")
+
+    private fun isFloatingCouponType(couponType: String): Boolean =
+        couponType in setOf("COUPON_TYPE_FLOATING", "COUPON_TYPE_VARIABLE")
+
+    private fun isAcceptableCouponType(couponType: String, excludeFloating: Boolean): Boolean =
+        isFixedCouponType(couponType) || (!excludeFloating && isFloatingCouponType(couponType))
 }
 
 // Печать результатов
 fun printResults(bonds: List<BondData>, config: BondConfig) {
+    val sortLabel = if (config.excludeFloating) "ДОХОДНОСТИ" else "КУПОНУ"
     println("======================================================================================================================================================")
-    println("  ТОП-${config.maxBondsCount} ОБЛИГАЦИЙ ПО ДОХОДНОСТИ  |  Частота купона: ${config.couponFrequency}/год  |  Без амортизации: ${config.noAmortization}")
+    println("  ТОП-${config.maxBondsCount} ОБЛИГАЦИЙ ПО $sortLabel  |  Частота купона: ${config.couponFrequency}/год  |  Без амортизации: ${config.noAmortization}  |  Без флоатеров: ${config.excludeFloating}  |  Без квал.: ${config.excludeQualInvestorOnly}")
     println("======================================================================================================================================================")
     
     if (bonds.isEmpty()) {
@@ -718,8 +658,8 @@ fun printResults(bonds: List<BondData>, config: BondConfig) {
     }
 
     println()
-    println("#    | Тикер        | Название                  |  Цена  |  Купон   | Купон% |  YTM%  | Дней  |  Рейтинг   | Качество |    Сектор")
-    println("---------------------------------------------------------------------------------------------------------------------------------------------")
+    println("#    | Тикер        | Название                  |  Цена  |  Купон   | Купон% |  YTM%  | Дней  |    Риск    |    Сектор")
+    println("---------------------------------------------------------------------------------------------------------------------------------------")
     
     bonds.forEachIndexed { index, bond ->
         val sectorShort = when (bond.sector) {
@@ -736,21 +676,9 @@ fun printResults(bonds: List<BondData>, config: BondConfig) {
             else -> bond.sector
         }.take(12)
         
-        // Показываем рейтинг DoHod (AAA, AA+ и т.д.)
-        val ratingDisplay = if (bond.dohodRating.isNotEmpty()) {
-            bond.dohodRating
-        } else {
-            "н/д"
-        }
+        val riskDisplay = RISK_TO_RATING[bond.riskLevel] ?: bond.riskLevel.removePrefix("RISK_LEVEL_")
         
-        // Показываем качество эмитента (0-10)
-        val qualityDisplay = if (bond.dohodQuality > 0) {
-            "${bond.dohodQuality}/10"
-        } else {
-            "н/д"
-        }
-        
-        println("%-4d | %-12s | %-25s | %5.2f%% | %6.2f руб | %5.1f%% | %5.1f%% | %5d  | %-10s | %-8s | %-12s".format(
+        println("%-4d | %-12s | %-25s | %5.2f%% | %6.2f руб | %5.1f%% | %5.1f%% | %5d  | %-10s | %-12s".format(
             index + 1,
             bond.ticker,
             bond.name.take(25),
@@ -759,24 +687,28 @@ fun printResults(bonds: List<BondData>, config: BondConfig) {
             bond.currentYield,
             bond.ytm,
             bond.daysToMaturity,
-            ratingDisplay,
-            qualityDisplay,
+            riskDisplay,
             sectorShort
         ))
     }
     
-    println("--------------------------------------------------------------------------------------------------------------------------------------------")
+    println("---------------------------------------------------------------------------------------------------------------------------------------")
     println()
-    println("  Примечание: DoHod - данные с analytics.dohod.ru (качество эмитента и рейтинг)")
+    println("  Примечание: риск — уровень T-Invest (${formatAcceptedRisk(config.minRiskLevel)})")
     
     // Итоговая статистика
     val avgYtm = bonds.map { it.ytm }.average()
+    val avgCoupon = bonds.map { it.couponAmount }.average()
     val avgDays = bonds.map { it.daysToMaturity }.average().toInt()
     val totalCoupons = bonds.sumOf { it.totalCoupons }
     
     println()
     println("  Статистика:")
-    println("    Средняя YTM: %.2f%%".format(avgYtm))
+    if (config.excludeFloating) {
+        println("    Средняя YTM: %.2f%%".format(avgYtm))
+    } else {
+        println("    Средний купон: %.2f руб".format(avgCoupon))
+    }
     println("    Средний срок: $avgDays дн.")
     println("    Суммарные купоны (на 1 облиг): %.2f руб".format(totalCoupons / bonds.size))
     println()
@@ -815,7 +747,9 @@ fun parseArgs(args: Array<String>): BondConfig {
     var targetYield = 16.0
     var couponFreq = 12
     var noAmort = true
-    var minRisk = "RISK_LEVEL_LOW"
+    var excludeFloating = true
+    var excludeQualOnly = true
+    var minRisk = "RISK_LEVEL_MODERATE"
     var maxCount = 10
     var capital = 100_000.0
     var minDays = 90
@@ -836,8 +770,16 @@ fun parseArgs(args: Array<String>): BondConfig {
                 noAmort = false
                 i++
             }
+            args[i] == "--allow-floating" -> {
+                excludeFloating = false
+                i++
+            }
+            args[i] == "--allow-qual" -> {
+                excludeQualOnly = false
+                i++
+            }
             args[i] == "--min-risk" && i + 1 < args.size -> {
-                minRisk = args[i + 1]
+                minRisk = normalizeRiskLevel(args[i + 1])
                 i += 2
             }
             args[i] == "--count" && i + 1 < args.size -> {
@@ -862,7 +804,9 @@ fun parseArgs(args: Array<String>): BondConfig {
                 println("  --yield <value>          Целевая доходность (по умолчанию: 16.0)")
                 println("  --coupon-freq <value>    Частота купона в год (по умолчанию: 12)")
                 println("  --allow-amortization     Разрешить амортизацию (по умолчанию: false)")
-                println("  --min-risk <level>       Мин. уровень риска (по умолчанию: RISK_LEVEL_LOW)")
+                println("  --allow-floating         Разрешить флоатеры (по умолчанию: false)")
+                println("  --allow-qual             Разрешить бумаги для квал. инвесторов (по умолчанию: false)")
+                println("  --min-risk <level>       Макс. риск: AAA (только надежные), MODERATE (надежные+средние, по умолчанию)")
                 println("  --count <value>          Кол-во облигаций в топе (по умолчанию: 10)")
                 println("  --capital <value>        Капитал для инвестиций (по умолчанию: 100000)")
                 println("  --min-days <value>       Мин. дней до погашения (по умолчанию: 90)")
@@ -878,6 +822,8 @@ fun parseArgs(args: Array<String>): BondConfig {
         targetYield = targetYield,
         couponFrequency = couponFreq,
         noAmortization = noAmort,
+        excludeFloating = excludeFloating,
+        excludeQualInvestorOnly = excludeQualOnly,
         minRiskLevel = minRisk,
         maxBondsCount = maxCount,
         capital = capital,
