@@ -86,7 +86,23 @@ data class InstrumentInfo(
     val ticker: String,
     val classCode: String,
     val instrumentType: String,
-    val maturityDate: String = ""
+    val maturityDate: String = "",
+    val isin: String = "",
+    val uid: String = ""
+)
+
+/**
+ * Действия для ребалансировки портфеля.
+ */
+data class RebalanceAction(
+    val type: String,           // "BUY_FUTURES", "SELL_FUTURES", "BUY_LQDT", "SELL_LQDT"
+    val figi: String,
+    val ticker: String,
+    val classCode: String = "",
+    val uid: String = "",
+    val quantity: Int,
+    val price: Double,
+    val amount: Double
 )
 
 class TcsClient(private val apiKey: String) {
@@ -179,6 +195,20 @@ class TcsClient(private val apiKey: String) {
     }
 
     /**
+     * Поиск инструмента по ISIN.
+     * FindInstrument API не принимает ISIN напрямую — ищем по тикеру и фильтруем по ISIN.
+     */
+    fun findByIsin(isin: String): InstrumentInfo? {
+        // Сначала пробуем поискать по тикеру LQDT
+        val byTicker = findAllInstruments("LQDT")
+        val match = byTicker.firstOrNull { it.isin == isin }
+        if (match != null) return match
+        // Фоллбэк: ищем по самому ISIN (мungkin API вернёт результат)
+        val byIsin = findAllInstruments(isin)
+        return byIsin.firstOrNull { it.isin == isin }
+    }
+
+    /**
      * Поиск NASDAQ фьючерсов с оценкой выгодности контракта.
      * Выбирает контракт с оптимальным соотношением ликвидности и ГО,
      * а не просто ближайший по дате экспирации.
@@ -231,6 +261,106 @@ class TcsClient(private val apiKey: String) {
         val body = """{"figi": "$figi", "interval": "CANDLE_INTERVAL_DAY", "limit": 1}"""
         val json = post(url, body, retries = 2, silent = true) ?: return null
         return parseLastCandleClose(json)
+    }
+
+    fun getCandlesByUid(uid: String): Double? {
+        val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
+        val body = """{"instrumentId": "$uid", "interval": "CANDLE_INTERVAL_DAY", "limit": 1}"""
+        val json = post(url, body, retries = 2, silent = true) ?: return null
+        return parseLastCandleClose(json)
+    }
+
+    /**
+     * Размещение ордера через TCS API.
+     * @param accountId ID аккаунта
+     * @param figi FIGI инструмента
+     * @param ticker тикер инструмента (fallback)
+     * @param classCode класс инструмента (fallback)
+     * @param uid UID инструмента (приоритетный идентификатор)
+     * @param quantity количество (для фьючерсов = количество контрактов)
+     * @param direction "ORDER_DIRECTION_BUY" или "ORDER_DIRECTION_SELL"
+     * @param orderType "ORDER_TYPE_MARKET" или "ORDER_TYPE_LIMIT"
+     * @param price цена для лимитного ордера (null для рыночного)
+     * @return orderId или null при ошибке
+     */
+    fun postOrder(
+        accountId: String,
+        figi: String,
+        quantity: Long,
+        direction: String,
+        orderType: String = "ORDER_TYPE_MARKET",
+        price: Double? = null,
+        ticker: String = "",
+        classCode: String = "",
+        uid: String = ""
+    ): String? {
+        val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder"
+        val priceField = if (price != null && orderType == "ORDER_TYPE_LIMIT") {
+            """, "price": {"units": "${price.toLong()}", "nano": ${(price % 1 * 1_000_000_000).toLong()}}"""
+        } else ""
+        // Приоритет: uid > figi > ticker+classCode
+        val instrumentId = when {
+            uid.isNotEmpty() -> """, "instrumentId": "$uid""""
+            figi.isNotEmpty() -> """, "figi": "$figi""""
+            ticker.isNotEmpty() && classCode.isNotEmpty() -> """, "ticker": "$ticker", "classCode": "$classCode""""
+            else -> """, "figi": "$figi""""
+        }
+        val body = """{"accountId": "$accountId"$instrumentId, "quantity": $quantity, "direction": "$direction", "orderType": "$orderType"$priceField, "orderId": "${System.currentTimeMillis()}"}"""
+        val idDesc = when {
+            uid.isNotEmpty() -> uid
+            figi.isNotEmpty() -> figi
+            else -> "$ticker:$classCode"
+        }
+        println("  [API] PostOrder: $direction $quantity x $idDesc")
+        val json = post(url, body, retries = 2) ?: return null
+        val orderId = extractString(json, "orderId")
+        val execStatus = extractString(json, "executedExecutedQuantity")
+        val rejects = extractString(json, "rejectReason")
+        if (rejects.isNotEmpty()) {
+            println("  [ERROR] Ордер отклонён: $rejects")
+            return null
+        }
+        println("  [API] OrderId: $orderId")
+        return orderId
+    }
+
+    /**
+     * Получение статуса ордера.
+     */
+    fun getOrderState(accountId: String, orderId: String): String? {
+        val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/GetOrderState"
+        val body = """{"accountId": "$accountId", "orderId": "$orderId"}"""
+        val json = post(url, body, retries = 2, silent = true) ?: return null
+        return extractString(json, "executedExecutedQuantity")
+    }
+
+    /**
+     * Получение списка активных ордеров.
+     */
+    fun getOrders(accountId: String): List<String> {
+        val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/GetOrders"
+        val body = """{"accountId": "$accountId"}"""
+        val json = post(url, body, retries = 2, silent = true) ?: return emptyList()
+        val orderIds = mutableListOf<String>()
+        var searchStart = 0
+        while (true) {
+            val idx = json.indexOf("\"orderId\"", searchStart)
+            if (idx < 0) break
+            val orderId = extractString(json.substring(idx), "orderId")
+            if (orderId.isNotEmpty()) orderIds.add(orderId)
+            searchStart = idx + 10
+        }
+        return orderIds
+    }
+
+    /**
+     * Отмена ордера.
+     */
+    fun cancelOrder(accountId: String, orderId: String): Boolean {
+        val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/CancelOrder"
+        val body = """{"accountId": "$accountId", "orderId": "$orderId"}"""
+        val json = post(url, body, retries = 2) ?: return false
+        return json.contains("canceled")
     }
 
     private fun extractCashTotal(json: String): Double {
@@ -491,7 +621,9 @@ class TcsClient(private val apiKey: String) {
             ticker = extractString(obj, "ticker"),
             classCode = extractString(obj, "classCode"),
             instrumentType = extractString(obj, "instrumentType"),
-            maturityDate = extractString(obj, "maturityDate").substringBefore("T")
+            maturityDate = extractString(obj, "maturityDate").substringBefore("T"),
+            isin = extractString(obj, "isin"),
+            uid = extractString(obj, "uid")
         )
     }
 
@@ -521,10 +653,12 @@ class TcsClient(private val apiKey: String) {
                                 objDepth--
                                 if (objDepth == 0 && objStart >= 0) {
                                     val obj = content.substring(objStart, j + 1)
-                                    val instId = extractString(obj, "figi").ifEmpty { extractString(obj, "instrumentUid") }
+                                    val figi = extractString(obj, "figi")
+                                    val instUid = extractString(obj, "instrumentUid")
                                     val price = extractMoney(obj, "price")
-                                    if (instId.isNotEmpty() && price != null) {
-                                        prices[instId] = price
+                                    if (price != null) {
+                                        if (figi.isNotEmpty()) prices[figi] = price
+                                        if (instUid.isNotEmpty()) prices[instUid] = price
                                     }
                                     objStart = -1
                                 }
@@ -589,9 +723,12 @@ fun readDouble(prompt: String): Double {
 }
 
 fun main(args: Array<String>) {
+    val autoMode = args.contains("--auto")
+
     println("================================================================")
     println("  NASD SCANNER (Фьючерсы + Ликвидность)")
     println("  Дата: ${LocalDate.now().format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))}")
+    if (autoMode) println("  РЕЖИМ: АВТОМАТИЧЕСКАЯ РЕБАЛАНСИРОВКА")
     println("================================================================")
     println()
 
@@ -725,14 +862,40 @@ fun main(args: Array<String>) {
 
     println("  [4/5] Получение рыночных котировок...")
 
-    val prices = tcs.getLastPrices(listOf(nasdInstrument.figi))
+    // Поиск LQDT по ISIN
+    val lqdtIsin = "RU000A1014L8"
+    val lqdtInstrument = tcs.findByIsin(lqdtIsin)
+    val lqdtTicker: String
+    val lqdtClassCode: String
+    if (lqdtInstrument != null) {
+        lqdtTicker = lqdtInstrument.ticker
+        lqdtClassCode = lqdtInstrument.classCode
+        println("  LQDT ISIN $lqdtIsin -> ticker: ${lqdtTicker}, classCode: ${lqdtClassCode}, uid: ${lqdtInstrument.uid}")
+    } else {
+        lqdtTicker = "LQDT"
+        lqdtClassCode = ""
+        println("  [WARN] ISIN $lqdtIsin не найден, используем ticker по умолчанию: $lqdtTicker")
+    }
+    // Для цен: NASD по FIGI, LQDT по uid
+    val lqdtPriceId = if (lqdtInstrument != null && lqdtInstrument.uid.isNotEmpty()) lqdtInstrument.uid else lqdtIsin
+    val prices = tcs.getLastPrices(listOf(nasdInstrument.figi, lqdtPriceId))
 
-    val nasdPrice = prices[nasdInstrument.figi] ?: tcs.getLastCandle(nasdInstrument.figi)
+    val nasdPrice = prices[nasdInstrument.figi]
+        ?: tcs.getLastCandle(nasdInstrument.figi)
+        ?: if (nasdInstrument.uid.isNotEmpty()) tcs.getCandlesByUid(nasdInstrument.uid) else null
     if (nasdPrice == null) {
         println("  [ERROR] Не удалось получить цену фьючерса NASD (${nasdInstrument.figi})")
         kotlin.system.exitProcess(1)
     }
     println("  Цена NASD: %.2f руб".format(nasdPrice).replace(',', '.'))
+
+    val tmonPrice = prices[lqdtPriceId]
+        ?: tcs.getCandlesByUid(lqdtInstrument?.uid ?: "")
+    if (tmonPrice == null) {
+        println("  [ERROR] Не удалось получить цену LQDT (uid: ${lqdtInstrument?.uid})")
+        kotlin.system.exitProcess(1)
+    }
+    println("  Цена LQDT: %.2f руб".format(tmonPrice).replace(',', '.'))
 
     // 5. Получение ГО и расчет
     val fullContractCostRur = nasdPrice
@@ -756,14 +919,31 @@ fun main(args: Array<String>) {
 
     // Вызываем расчет с учетом текущих позиций по фьючерсам
     // totalAccountValue = liquidAssets (кэш + ликвидные бумаги), фьючерсы не считаются
-    calculatePortfolioStructure(
+    val actions = calculatePortfolioStructure(
         totalAccountValue = liquidAssets,
         fullContractCostRur = fullContractCostRur,
         singleContractGoRur = singleContractGoRur,
         existingFuturesCount = existingFuturesCount,
         existingFuturesFigi = existingFuturesFigi,
-        existingFuturesAvgPrice = existingFuturesAvgPrice
+        existingFuturesAvgPrice = existingFuturesAvgPrice,
+        futuresTicker = nasdInstrument.ticker,
+        futuresFigi = nasdInstrument.figi,
+        lqdtTicker = lqdtTicker,
+        lqdtClassCode = lqdtClassCode,
+        lqdtUid = lqdtInstrument?.uid ?: "",
+        lqdtPrice = tmonPrice,
+        currentCash = cash,
+        currentLqdtValue = liquidSecuritiesValue
     )
+
+    // Автоматическая ребалансировка (только при --auto)
+    if (autoMode) {
+        executeRebalancing(
+            accountId = accountId,
+            tcs = tcs,
+            actions = actions
+        )
+    }
 }
 
 /**
@@ -771,18 +951,29 @@ fun main(args: Array<String>) {
  * - Текущих позиций по фьючерсам (ребалансировка)
  * - Выбора наиболее выгодного контракта
  * - Безопасности маржинальных требований
+ *
+ * @return список действий для ребалансировки
  */
 fun calculatePortfolioStructure(
     totalAccountValue: Double,
     fullContractCostRur: Double,
     singleContractGoRur: Double,
-    existingFuturesCount: Int = 0,
-    existingFuturesFigi: String = "",
-    existingFuturesAvgPrice: Double = 0.0
-) {
+    existingFuturesCount: Int,
+    existingFuturesFigi: String,
+    existingFuturesAvgPrice: Double,
+    futuresTicker: String,
+    futuresFigi: String,
+    lqdtTicker: String,
+    lqdtClassCode: String,
+    lqdtUid: String,
+    lqdtPrice: Double,
+    currentCash: Double,
+    currentLqdtValue: Double
+): List<RebalanceAction> {
     val total = BigDecimal.valueOf(totalAccountValue)
     val contractCost = BigDecimal.valueOf(fullContractCostRur)
     val go = BigDecimal.valueOf(singleContractGoRur)
+    val actions = mutableListOf<RebalanceAction>()
 
     // 1. Расчет целевых долей в рублях
     val targetCash = total.multiply(CASH_TARGET_PERCENT)
@@ -818,7 +1009,7 @@ fun calculatePortfolioStructure(
 
     println("  ИДЕАЛЬНОЕ РАСПРЕДЕЛЕНИЕ АКТИВОВ ДЛЯ ВВОДА В ТЕРМИНАЛ:")
     println("  1. Оставить в КЭШЕ (чистые рубли): ${targetCash.setScale(2, RoundingMode.HALF_UP)} руб.")
-    println("  2. Купить ФОНД ЛИКВИДНОСТИ (TMON): ${targetLiquidityFund.setScale(2, RoundingMode.HALF_UP)} руб.")
+    println("  2. Купить ФОНД ЛИКВИДНОСТИ (LQDT): ${targetLiquidityFund.setScale(2, RoundingMode.HALF_UP)} руб.")
     println("  3. Удерживать ФЬЮЧЕРСОВ NASD: $targetFuturesCount шт.")
 
     // Блок ребалансировки
@@ -827,40 +1018,162 @@ fun calculatePortfolioStructure(
     println("----------------------------------------------------------------")
     if (futuresDifference > 0) {
         val requiredGo = go.multiply(BigDecimal.valueOf(futuresDifference.toLong()))
+        val requiredGoD = requiredGo.toDouble()
         println("  РЕБАЛАНСИРОВКА ТРЕБУЕТСЯ:")
         println("  [!!!] Нужно ДОКУПИТЬ: $futuresDifference шт. фьючерсов NASD")
         println("        Требуется ГО: ${requiredGo.setScale(2, RoundingMode.HALF_UP)} руб.")
-        println("        Источник: продать часть TMON и перевести в ГО")
+
+        // Проверяем, хватает ли кэша для покупки фьючерсов
+        if (currentCash >= requiredGoD) {
+            // Кэша достаточно — покупаем фьючерсы напрямую
+            println("        Источник: свободный кэш (${"%.2f".format(currentCash)} руб.)")
+            actions.add(RebalanceAction(
+                type = "BUY_FUTURES",
+                figi = futuresFigi,
+                ticker = futuresTicker,
+                quantity = futuresDifference,
+                price = fullContractCostRur,
+                amount = requiredGoD
+            ))
+        } else {
+            // Кэша не хватает — нужно продать LQDT на недостающую сумму
+            val deficit = requiredGoD - currentCash
+            val lqdtSellValue = deficit
+            val lqdtSellQty = if (lqdtPrice > 0) (lqdtSellValue / lqdtPrice).toInt().coerceAtLeast(1) else 0
+
+            println("        Кэша不够: нужно ${"%.2f".format(requiredGoD)} руб., есть ${"%.2f".format(currentCash)} руб.")
+            println("        Источник: продать ${lqdtSellQty} шт. LQDT + весь кэш")
+
+            // Сначала покупаем фьючерсы
+            actions.add(RebalanceAction(
+                type = "BUY_FUTURES",
+                figi = futuresFigi,
+                ticker = futuresTicker,
+                quantity = futuresDifference,
+                price = fullContractCostRur,
+                amount = requiredGoD
+            ))
+
+            // Затем продаем LQDT для покрытия дефицита
+            if (lqdtSellQty > 0) {
+                actions.add(RebalanceAction(
+                    type = "SELL_LQDT",
+                    figi = "",
+                    ticker = lqdtTicker,
+                    classCode = lqdtClassCode,
+                    uid = lqdtUid,
+                    quantity = lqdtSellQty,
+                    price = lqdtPrice,
+                    amount = lqdtSellValue
+                ))
+            }
+        }
     } else if (futuresDifference < 0) {
         val freedGo = go.multiply(BigDecimal.valueOf((-futuresDifference).toLong()))
         println("  РЕБАЛАНСИРОВКА ТРЕБУЕТСЯ:")
         println("  [!!!] Нужно ПРОДАТЬ: ${-futuresDifference} шт. фьючерсов NASD")
         println("        Освободится ГО: ${freedGo.setScale(2, RoundingMode.HALF_UP)} руб.")
+        // Добавляем действие: продажа фьючерсов
+        actions.add(RebalanceAction(
+            type = "SELL_FUTURES",
+            figi = futuresFigi,
+            ticker = futuresTicker,
+            quantity = -futuresDifference,
+            price = fullContractCostRur,
+            amount = freedGo.toDouble()
+        ))
 
         // Рекомендация: куда девать освободившийся ГО
         // После продажи ГО становится свободным кэшем.
-        // Нужно решить: доложить в TMON или оставить как кэш.
+        // Нужно решить: доложить в LQDT или оставить как кэш.
         val freedGoD = freedGo.toDouble()
         val currentCashAfterSale = totalAccountValue + freedGoD  // кэш вырос на освобождённое ГО
         val targetCashAfter = currentCashAfterSale * CASH_TARGET_PERCENT.toDouble()
         val newFundTarget = currentCashAfterSale - targetCashAfter
 
-        // Сколько TMON будет после продажи (TMON не меняется при продаже фьючерса)
-        // Нужно докупить TMON на сумму, чтобы довести фонд до нового целевого
+        // Сколько LQDT будет после продажи (LQDT не меняется при продаже фьючерса)
+        // Нужно докупить LQDT на сумму, чтобы довести фонд до нового целевого
         val currentTmonValue = totalAccountValue - (totalAccountValue * CASH_TARGET_PERCENT.toDouble())
         val tmonToBuy = newFundTarget - currentTmonValue
 
         if (tmonToBuy > 0) {
-            println("        Рекомендация: докупить TMON на ${BigDecimal.valueOf(tmonToBuy).setScale(2, RoundingMode.HALF_UP)} руб.")
+            println("        Рекомендация: докупить LQDT на ${BigDecimal.valueOf(tmonToBuy).setScale(2, RoundingMode.HALF_UP)} руб.")
             println("        Остаток кэша: ${BigDecimal.valueOf(targetCashAfter).setScale(2, RoundingMode.HALF_UP)} руб.")
+            // Добавляем действие: покупка LQDT
+            actions.add(RebalanceAction(
+                type = "BUY_LQDT",
+                figi = "",
+                ticker = lqdtTicker,
+                classCode = lqdtClassCode,
+                uid = lqdtUid,
+                quantity = if (lqdtPrice > 0) (tmonToBuy / lqdtPrice).toInt().coerceAtLeast(1) else 0,
+                price = lqdtPrice,
+                amount = tmonToBuy
+            ))
         } else if (tmonToBuy < 0) {
-            println("        Рекомендация: продать TMON на ${BigDecimal.valueOf(-tmonToBuy).setScale(2, RoundingMode.HALF_UP)} руб.")
+            println("        Рекомендация: продать LQDT на ${BigDecimal.valueOf(-tmonToBuy).setScale(2, RoundingMode.HALF_UP)} руб.")
             println("        Остаток кэша: ${BigDecimal.valueOf(targetCashAfter).setScale(2, RoundingMode.HALF_UP)} руб.")
+            // Добавляем действие: продажа LQDT
+            actions.add(RebalanceAction(
+                type = "SELL_LQDT",
+                figi = "",
+                ticker = lqdtTicker,
+                classCode = lqdtClassCode,
+                uid = lqdtUid,
+                quantity = if (lqdtPrice > 0) (-tmonToBuy / lqdtPrice).toInt().coerceAtLeast(1) else 0,
+                price = lqdtPrice,
+                amount = -tmonToBuy
+            ))
         } else {
             println("        Рекомендация: оставить как кэш (${BigDecimal.valueOf(targetCashAfter).setScale(2, RoundingMode.HALF_UP)} руб.)")
         }
     } else {
-        println("  [OK] Портфель сбалансирован. Действия не требуются.")
+        println("  [OK] Фьючерсы сбалансированы.")
+    }
+
+    // Проверяем баланс LQDT: если кэша больше целевого — докупаем LQDT
+    // targetCash = 10% от totalAccountValue
+    // Если currentCash > targetCash, разницу тратим на LQDT
+    run {
+        val targetCashD = totalAccountValue * CASH_TARGET_PERCENT.toDouble()
+        val excessCash = currentCash - targetCashD
+        if (excessCash > lqdtPrice) {
+            val lqdtQty = (excessCash / lqdtPrice).toInt()
+            val lqdtCost = lqdtQty * lqdtPrice
+            println("  РЕБАЛАНСИРОВКА LQDT:")
+            println("  [!!!] Нужно ДОКУПИТЬ: $lqdtQty шт. LQDT на ${"%.2f".format(lqdtCost)} руб.")
+            println("        Кэш: ${"%.2f".format(currentCash)} руб., целевой: ${"%.2f".format(targetCashD)} руб.")
+            actions.add(RebalanceAction(
+                type = "BUY_LQDT",
+                figi = "",
+                ticker = lqdtTicker,
+                classCode = lqdtClassCode,
+                uid = lqdtUid,
+                quantity = lqdtQty,
+                price = lqdtPrice,
+                amount = lqdtCost
+            ))
+        } else if (currentLqdtValue > 0 && currentCash < targetCashD - lqdtPrice) {
+            // Кэша мало — продаем часть LQDT
+            val deficit = targetCashD - currentCash
+            val lqdtSellQty = (deficit / lqdtPrice).toInt().coerceAtLeast(1)
+            val lqdtSellValue = lqdtSellQty * lqdtPrice
+            println("  РЕБАЛАНСИРОВКА LQDT:")
+            println("  [!!!] Нужно ПРОДАТЬ: $lqdtSellQty шт. LQDT на ${"%.2f".format(lqdtSellValue)} руб.")
+            println("        Кэш: ${"%.2f".format(currentCash)} руб., целевой: ${"%.2f".format(targetCashD)} руб.")
+            actions.add(RebalanceAction(
+                type = "SELL_LQDT",
+                figi = "",
+                ticker = lqdtTicker,
+                classCode = lqdtClassCode,
+                uid = lqdtUid,
+                quantity = lqdtSellQty,
+                price = lqdtPrice,
+                amount = lqdtSellValue
+            ))
+        } else {
+            println("  [OK] LQDT сбалансирован.")
+        }
     }
 
     println("----------------------------------------------------------------")
@@ -884,6 +1197,8 @@ fun calculatePortfolioStructure(
     println("  - Если кэш упал (например, до 4%), программа порекомендует")
     println("    продать часть фонда ликвидности для восстановления 10% кэша.")
     println("================================================================")
+
+    return actions
 }
 
 /**
@@ -964,6 +1279,85 @@ fun selectBestFuturesContract(
     return bestContract
 }
 
+/**
+ * Выполнение автоматической ребалансировки через TCS API.
+ * @param accountId ID аккаунта
+ * @param tcs клиент TCS API
+ * @param actions список действий для ребалансировки
+ * @param dryRun если true, ордера не размещаются
+ */
+fun executeRebalancing(
+    accountId: String,
+    tcs: TcsClient,
+    actions: List<RebalanceAction>
+) {
+    if (actions.isEmpty()) {
+        println("  [OK] Ребалансировка не требуется.")
+        return
+    }
 
+    println()
+    println("================================================================")
+    println("  ВЫПОЛНЕНИЕ РЕБАЛАНСИРОВКИ")
+    println("================================================================")
+
+    // Сначала выполняем продажи (освобождаем средства)
+    val sellActions = actions.filter { it.type.startsWith("SELL") }
+    // Покупки: сначала LQDT (ETF), затем фьючерсы
+    val buyLqdt = actions.filter { it.type == "BUY_LQDT" }
+    val buyFutures = actions.filter { it.type == "BUY_FUTURES" }
+    val buyActions = buyLqdt + buyFutures
+
+    for (action in sellActions) {
+        println("  [SELL] ${action.ticker}: ${action.quantity} шт по ${"%.2f".format(action.price)} = ${"%.2f".format(action.amount)} руб")
+        val orderDirection = if (action.type.contains("FUTURES")) "ORDER_DIRECTION_SELL" else "ORDER_DIRECTION_SELL"
+        val orderId = tcs.postOrder(
+            accountId = accountId,
+            figi = action.figi,
+            quantity = action.quantity.toLong(),
+            direction = orderDirection,
+            orderType = "ORDER_TYPE_MARKET",
+            ticker = action.ticker,
+            classCode = action.classCode,
+            uid = action.uid
+        )
+        if (orderId != null) {
+            println("  [OK] Ордер размещён: $orderId")
+        } else if (action.type.contains("LQDT")) {
+            println("  [WARN] ${action.ticker} недоступен для API-торговли, пропускаю")
+        } else {
+            println("  [ERROR] Ордер не размещён! Прерываю ребалансировку.")
+            return
+        }
+        Thread.sleep(500)
+    }
+
+    for (action in buyActions) {
+        println("  [BUY] ${action.ticker}: ${action.quantity} шт по ${"%.2f".format(action.price)} = ${"%.2f".format(action.amount)} руб")
+        val orderId = tcs.postOrder(
+            accountId = accountId,
+            figi = action.figi,
+            quantity = action.quantity.toLong(),
+            direction = "ORDER_DIRECTION_BUY",
+            orderType = "ORDER_TYPE_MARKET",
+            ticker = action.ticker,
+            classCode = action.classCode,
+            uid = action.uid
+        )
+        if (orderId != null) {
+            println("  [OK] Ордер размещён: $orderId")
+        } else if (action.type.contains("LQDT")) {
+            println("  [WARN] ${action.ticker} недоступен для API-торговли, пропускаю")
+        } else {
+            println("  [ERROR] Ордер не размещён! Прерываю ребалансировку.")
+            return
+        }
+        Thread.sleep(500)
+    }
+
+    println("================================================================")
+    println("  РЕБАЛАНСИРОВКА ЗАВЕРШЕНА")
+    println("================================================================")
+}
 
 main(args)
