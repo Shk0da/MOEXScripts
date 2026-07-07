@@ -152,7 +152,14 @@ class TcsClient(private val apiKey: String) {
         val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OperationsService/GetWithdrawLimits"
         val body = """{"accountId": "$accountId"}"""
         val json = post(url, body, silent = true) ?: return 0.0
-        return extractCashTotal(json)
+        val totalCash = extractCashTotal(json)
+        val blocked = extractBlockedMargin(json)
+        if (blocked > 0.0) {
+            println("  Кэш (всего): %.2f руб".format(totalCash).replace(',', '.'))
+            println("  Заблокировано (ГО): %.2f руб".format(blocked).replace(',', '.'))
+            println("  Свободный кэш: %.2f руб".format(totalCash - blocked).replace(',', '.'))
+        }
+        return totalCash - blocked
     }
 
     fun findInstrument(query: String, instrumentType: String = ""): InstrumentInfo? {
@@ -255,6 +262,60 @@ class TcsClient(private val apiKey: String) {
                     }
                 }
             }
+        }
+        return total
+    }
+
+    /**
+     * Извлекает заблокированную сумму (ГО) из ответа GetWithdrawLimits.
+     * Ищет "blocked" или "blockedGuarantee" массив, суммирует RUB.
+     */
+    private fun extractBlockedMargin(json: String): Double {
+        var total = 0.0
+        for (key in listOf("blockedGuarantee", "blocked")) {
+            val arr = json.indexOf("\"$key\"")
+            if (arr < 0) continue
+
+            var bracketStart = -1
+            for (i in arr until json.length) {
+                if (json[i] == '[') { bracketStart = i; break }
+            }
+            if (bracketStart < 0) continue
+
+            var bracketEnd = -1
+            var depth = 0
+            for (i in bracketStart until json.length) {
+                when (json[i]) {
+                    '[' -> depth++
+                    ']' -> {
+                        depth--
+                        if (depth == 0) { bracketEnd = i; break }
+                    }
+                }
+            }
+            if (bracketEnd < 0) continue
+
+            val content = json.substring(bracketStart + 1, bracketEnd)
+            var objDepth = 0
+            var objStart = -1
+            for (i in content.indices) {
+                when (content[i]) {
+                    '{' -> { if (objDepth == 0) objStart = i; objDepth++ }
+                    '}' -> {
+                        objDepth--
+                        if (objDepth == 0 && objStart >= 0) {
+                            val obj = content.substring(objStart, i + 1)
+                            val currency = extractString(obj, "currency")
+                            val units = extractMoney(obj, "units") ?: 0.0
+                            val nano = Regex("\"nano\"\\s*:\\s*(\\d+)").find(obj)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                            val amount = units + nano / 1_000_000_000.0
+                            if (currency == "rub" || currency == "RUB") total += amount
+                            objStart = -1
+                        }
+                    }
+                }
+            }
+            if (total > 0) break  // blockedGuarantee приоритетнее blocked
         }
         return total
     }
@@ -581,17 +642,20 @@ fun main(args: Array<String>) {
     var futuresValue = 0.0           // Фьючерсы — не ликвидные средства, отдельно
     for (pos in positions) {
         val value = pos.quantity * (pos.curPrice ?: 0.0)
-        if (pos.instrumentType.equals("FUTURES", ignoreCase = true)) {
-            futuresValue += value
-        } else {
-            liquidSecuritiesValue += value
+        when {
+            pos.instrumentType.equals("FUTURES", ignoreCase = true) -> futuresValue += value
+            // Кэш (RUB000UTSTOM и т.п.) — считается отдельно через getWithdrawLimits,
+            // исключаем чтобы не задвоить с заблокированными средствами
+            pos.instrumentType.equals("CURRENCY", ignoreCase = true) -> { }
+            else -> liquidSecuritiesValue += value
         }
     }
 
-    // Для расчета покупки фонда ликвидности доступны: кэш + ликвидные бумаги
+    // Для расчета покупки фонда ликвидности доступны: свободный кэш + ликвидные бумаги
+    // cash уже вычитает заблокированное ГО
     val liquidAssets = liquidSecuritiesValue + cash
 
-    println("  Кэш: %.2f руб".format(cash).replace(',', '.'))
+    println("  Свободный кэш (за вычетом ГО): %.2f руб".format(cash).replace(',', '.'))
     println("  Ликвидные бумаги (ETF/акции/облигации): %.2f руб".format(liquidSecuritiesValue).replace(',', '.'))
     println("  Фьючерсы (нельзя тратить): %.2f руб".format(futuresValue).replace(',', '.'))
     println("  Доступно для инвестирования: %.2f руб".format(liquidAssets).replace(',', '.'))
@@ -758,15 +822,43 @@ fun calculatePortfolioStructure(
     println("  3. Удерживать ФЬЮЧЕРСОВ NASD: $targetFuturesCount шт.")
 
     // Блок ребалансировки
+    // При покупке фьючерса нужен ГО (не полная стоимость).
+    // При продаже освобождается ГО (не полная стоимость контракта).
     println("----------------------------------------------------------------")
     if (futuresDifference > 0) {
+        val requiredGo = go.multiply(BigDecimal.valueOf(futuresDifference.toLong()))
         println("  РЕБАЛАНСИРОВКА ТРЕБУЕТСЯ:")
         println("  [!!!] Нужно ДОКУПИТЬ: $futuresDifference шт. фьючерсов NASD")
-        println("        Стоимость докупки: ${contractCost.multiply(BigDecimal.valueOf(futuresDifference.toLong())).setScale(2, RoundingMode.HALF_UP)} руб.")
+        println("        Требуется ГО: ${requiredGo.setScale(2, RoundingMode.HALF_UP)} руб.")
+        println("        Источник: продать часть TMON и перевести в ГО")
     } else if (futuresDifference < 0) {
+        val freedGo = go.multiply(BigDecimal.valueOf((-futuresDifference).toLong()))
         println("  РЕБАЛАНСИРОВКА ТРЕБУЕТСЯ:")
         println("  [!!!] Нужно ПРОДАТЬ: ${-futuresDifference} шт. фьючерсов NASD")
-        println("        Получите: ${contractCost.multiply(BigDecimal.valueOf((-futuresDifference).toLong())).setScale(2, RoundingMode.HALF_UP)} руб.")
+        println("        Освободится ГО: ${freedGo.setScale(2, RoundingMode.HALF_UP)} руб.")
+
+        // Рекомендация: куда девать освободившийся ГО
+        // После продажи ГО становится свободным кэшем.
+        // Нужно решить: доложить в TMON или оставить как кэш.
+        val freedGoD = freedGo.toDouble()
+        val currentCashAfterSale = totalAccountValue + freedGoD  // кэш вырос на освобождённое ГО
+        val targetCashAfter = currentCashAfterSale * CASH_TARGET_PERCENT.toDouble()
+        val newFundTarget = currentCashAfterSale - targetCashAfter
+
+        // Сколько TMON будет после продажи (TMON не меняется при продаже фьючерса)
+        // Нужно докупить TMON на сумму, чтобы довести фонд до нового целевого
+        val currentTmonValue = totalAccountValue - (totalAccountValue * CASH_TARGET_PERCENT.toDouble())
+        val tmonToBuy = newFundTarget - currentTmonValue
+
+        if (tmonToBuy > 0) {
+            println("        Рекомендация: докупить TMON на ${BigDecimal.valueOf(tmonToBuy).setScale(2, RoundingMode.HALF_UP)} руб.")
+            println("        Остаток кэша: ${BigDecimal.valueOf(targetCashAfter).setScale(2, RoundingMode.HALF_UP)} руб.")
+        } else if (tmonToBuy < 0) {
+            println("        Рекомендация: продать TMON на ${BigDecimal.valueOf(-tmonToBuy).setScale(2, RoundingMode.HALF_UP)} руб.")
+            println("        Остаток кэша: ${BigDecimal.valueOf(targetCashAfter).setScale(2, RoundingMode.HALF_UP)} руб.")
+        } else {
+            println("        Рекомендация: оставить как кэш (${BigDecimal.valueOf(targetCashAfter).setScale(2, RoundingMode.HALF_UP)} руб.)")
+        }
     } else {
         println("  [OK] Портфель сбалансирован. Действия не требуются.")
     }
