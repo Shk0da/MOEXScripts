@@ -231,7 +231,9 @@ class TcsClient {
         val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OperationsService/GetWithdrawLimits"
         val body = """{"accountId": "$accountId"}"""
         val json = post(url, body, silent = true) ?: return 0.0
-        return extractCashTotal(json)
+        val totalCash = extractCashTotal(json)
+        val blocked = extractBlockedMargin(json)
+        return totalCash - blocked
     }
 
     private fun extractCashTotal(json: String): Double {
@@ -263,6 +265,60 @@ class TcsClient {
                     }
                 }
             }
+        }
+        return total
+    }
+
+    /**
+     * Извлекает заблокированную сумму (ГО) из ответа GetWithdrawLimits.
+     * Ищет "blocked" или "blockedGuarantee" массив, суммирует RUB.
+     */
+    private fun extractBlockedMargin(json: String): Double {
+        var total = 0.0
+        for (key in listOf("blockedGuarantee", "blocked")) {
+            val arr = json.indexOf("\"$key\"")
+            if (arr < 0) continue
+
+            var bracketStart = -1
+            for (i in arr until json.length) {
+                if (json[i] == '[') { bracketStart = i; break }
+            }
+            if (bracketStart < 0) continue
+
+            var bracketEnd = -1
+            var depth = 0
+            for (i in bracketStart until json.length) {
+                when (json[i]) {
+                    '[' -> depth++
+                    ']' -> {
+                        depth--
+                        if (depth == 0) { bracketEnd = i; break }
+                    }
+                }
+            }
+            if (bracketEnd < 0) continue
+
+            val content = json.substring(bracketStart + 1, bracketEnd)
+            var objDepth = 0
+            var objStart = -1
+            for (i in content.indices) {
+                when (content[i]) {
+                    '{' -> { if (objDepth == 0) objStart = i; objDepth++ }
+                    '}' -> {
+                        objDepth--
+                        if (objDepth == 0 && objStart >= 0) {
+                            val obj = content.substring(objStart, i + 1)
+                            val currency = extractString(obj, "currency")
+                            val units = extractMoney(obj, "units") ?: 0.0
+                            val nano = Regex("\"nano\"\\s*:\\s*(\\d+)").find(obj)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                            val amount = units + nano / 1_000_000_000.0
+                            if (currency == "rub" || currency == "RUB") total += amount
+                            objStart = -1
+                        }
+                    }
+                }
+            }
+            if (total > 0) break  // blockedGuarantee приоритетнее blocked
         }
         return total
     }
@@ -1314,9 +1370,16 @@ fun main(args: Array<String>) {
         for (acc in tcsAccounts) {
             val positions = tcs.getPortfolio(acc.id)
 
+            // Фьючерсы не считаются в капитале — только ликвидные позиции + кэш
             var accountEquity = 0.0
+            var futuresValue = 0.0
             for (pos in positions) {
-                accountEquity += pos.quantity * (pos.curPrice ?: 0.0)
+                val value = pos.quantity * (pos.curPrice ?: 0.0)
+                if (pos.instrumentType.equals("futures", ignoreCase = true)) {
+                    futuresValue += value
+                } else {
+                    accountEquity += value
+                }
             }
 
             val accountCash = tcs.getWithdrawLimits(acc.id)
@@ -1326,7 +1389,11 @@ fun main(args: Array<String>) {
                 "%.2f".format(accountCash).replace(',', '.')
             else
                 "н/д"
-            println("  [T-Invest] Счёт ${acc.name} (${acc.id}): ${positions.size} позиций, капитал %.2f руб, кэш $cashStr руб".format(accountEquity).replace(',', '.'))
+            print("  [T-Invest] Счёт ${acc.name} (${acc.id}): ${positions.size} позиций, капитал %.2f руб, кэш $cashStr руб".format(accountEquity).replace(',', '.'))
+            if (futuresValue > 0) {
+                print(" (фьючерсы: %.0f руб, в капитал не входят)".format(futuresValue).replace(',', '.'))
+            }
+            println()
 
             val securities = positions.filter {
                 it.instrumentType in setOf("bond", "share", "etf")
@@ -1491,18 +1558,27 @@ fun main(args: Array<String>) {
             .filter { it.value.quantity > 0 }
             .sortedByDescending { it.value.quantity * it.value.curPrice }
 
-        val totalValue = sortedHoldings.sumOf { it.value.quantity * it.value.curPrice }
+        // Фьючерсы не добавляют реальную стоимость портфелю — считаем только ГО.
+        // Разделяем на ликвидные активы и фьючерсы.
+        val liquidHoldings = sortedHoldings.filter { !it.value.instrumentType.equals("futures", ignoreCase = true) }
+        val futuresHoldings = sortedHoldings.filter { it.value.instrumentType.equals("futures", ignoreCase = true) }
+
+        val totalLiquidValue = liquidHoldings.sumOf { it.value.quantity * it.value.curPrice }
+        // Фьючерсы: полная стоимость контракта не является реальной стоимостью,
+        // но показываем для информации. Реальный вклад — только ГО.
+        val totalFuturesValue = futuresHoldings.sumOf { it.value.quantity * it.value.curPrice }
 
         if (sortedHoldings.isEmpty()) {
             println("  Нет позиций")
         } else {
-            val totalPortfolioValue = totalValue
+            val totalPortfolioValue = totalLiquidValue
 
             println(" #  | Тип   | Тикер             | Название                   | Кол-во |  Средняя |  Цена    |  Стоим.   |  Доля  | Купон/мес | Купон% | Погашение  | Ист")
             println("------------------------------------------------------------------------------------------------------------------------------------------")
 
             sortedHoldings.forEachIndexed { idx, (_, h) ->
                 val curValue = h.quantity * h.curPrice
+                // Для фьючерсов доля считается от ликвидных активов, не от полной стоимости
                 val share = if (totalPortfolioValue > 0) curValue / totalPortfolioValue * 100 else 0.0
 
                 val fixedPayments = h.payments.filter { it.type == "coupon" }
@@ -1542,13 +1618,24 @@ fun main(args: Array<String>) {
             }
 
             println("------------------------------------------------------------------------------------------------------------------------------------------")
-            val totalCost = sortedHoldings.sumOf { it.value.quantity * it.value.avgPrice }
-            val totalPnl = totalValue - totalCost
-            val pnlPct = if (totalCost > 0) totalPnl / totalCost * 100 else 0.0
+            val totalLiquidCost = liquidHoldings.sumOf { it.value.quantity * it.value.avgPrice }
+            val totalFuturesCost = futuresHoldings.sumOf { it.value.quantity * it.value.avgPrice }
+            val liquidPnl = totalLiquidValue - totalLiquidCost
+            val liquidPnlPct = if (totalLiquidCost > 0) liquidPnl / totalLiquidCost * 100 else 0.0
+            val futuresPnl = totalFuturesValue - totalFuturesCost
+            val futuresPnlPct = if (totalFuturesCost > 0) futuresPnl / totalFuturesCost * 100 else 0.0
+
             println()
-            println("  Итого: стоимость %.2f руб, затраты %.2f руб, P&L %+.2f руб (%+.2f%%)".format(
-                totalValue, totalCost, totalPnl, pnlPct
+            println("  Ликвидные активы:  %.2f руб (затраты %.2f руб, P&L %+.2f руб %+.2f%%)".format(
+                totalLiquidValue, totalLiquidCost, liquidPnl, liquidPnlPct
             ))
+            if (futuresHoldings.isNotEmpty()) {
+                println("  Фьючерсы (контракты): %.2f руб (P&L %+.2f руб %+.2f%%)".format(
+                    totalFuturesValue, futuresPnl, futuresPnlPct
+                ))
+                println("  ⚠ Фьючерсы НЕ считаются стоимостью портфеля — реальный вклад = только ГО.")
+            }
+            println("  Итого (портфель): %.2f руб".format(totalLiquidValue))
             println("==================================================================")
         }
 
@@ -1570,8 +1657,8 @@ fun main(args: Array<String>) {
         if (monthlyMap.isNotEmpty()) {
             val sortedMonths = monthlyMap.entries.sortedBy { it.key }
             val aggregatedMonthly = sortedMonths.take(12).associate { it.key to it.value.sumOf { p -> p.second } }
-            val payingHoldingsValue = sortedHoldings.filter { (_, h) -> h.payments.isNotEmpty() }.sumOf { (_, h) -> h.quantity * h.curPrice }
-            print(buildMonthlyChart(aggregatedMonthly, "ГРАФИК ОЖИДАЕМЫХ ВЫПЛАТ (КУПОНЫ + ДИВИДЕНДЫ) ПО МЕСЯЦАМ", portfolioCost = totalValue, payingPortfolioCost = payingHoldingsValue))
+            val payingHoldingsValue = liquidHoldings.filter { (_, h) -> h.payments.isNotEmpty() }.sumOf { (_, h) -> h.quantity * h.curPrice }
+            print(buildMonthlyChart(aggregatedMonthly, "ГРАФИК ОЖИДАЕМЫХ ВЫПЛАТ (КУПОНЫ + ДИВИДЕНДЫ) ПО МЕСЯЦАМ", portfolioCost = totalLiquidValue, payingPortfolioCost = payingHoldingsValue))
         } else {
             println()
             println("  Нет будущих выплат для отображения")
