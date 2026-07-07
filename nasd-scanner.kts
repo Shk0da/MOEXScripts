@@ -171,7 +171,12 @@ class TcsClient(private val apiKey: String) {
         return parseFindAllInstruments(json)
     }
 
-    fun findNearestNasdaqFutures(): InstrumentInfo? {
+    /**
+     * Поиск NASDAQ фьючерсов с оценкой выгодности контракта.
+     * Выбирает контракт с оптимальным соотношением ликвидности и ГО,
+     * а не просто ближайший по дате экспирации.
+     */
+    fun findBestNasdaqFutures(): List<InstrumentInfo> {
         val queries = listOf("NAZ", "NQ", "NASD")
         var candidates = emptyList<InstrumentInfo>()
         for (q in queries) {
@@ -179,8 +184,6 @@ class TcsClient(private val apiKey: String) {
         }
         candidates = candidates.distinctBy { it.figi }
 
-        // Фильтруем только MOEX фьючерсы и парсим дату экспирации из figi
-        // Формат figi: FUTNASDMMYY0 или FNASDMMYY000
         val today = LocalDate.now()
         val nasdFutures = candidates.filter { it.classCode == "SPBFUT" && it.figi.contains("NASD", ignoreCase = true) }
             .mapNotNull { inst ->
@@ -189,31 +192,15 @@ class TcsClient(private val apiKey: String) {
             }
             .sortedBy { it.second }
 
-        if (nasdFutures.isNotEmpty()) {
-            val best = nasdFutures.first()
-            println("  Ближайший: ${best.first.ticker} (${best.first.figi}) exp=${best.second}")
-            for ((inst, exp) in nasdFutures) {
-                println("    ${inst.ticker} (${inst.figi}) exp=$exp")
-            }
-            return best.first
-        }
-
-        // Fallback: без фильтра по дате
-        val anyMoex = candidates.filter { it.classCode == "SPBFUT" && it.figi.contains("NASD", ignoreCase = true) }
-        return anyMoex.firstOrNull()
+        // Возвращаем все доступные контракты для выбора лучшего
+        return nasdFutures.map { it.first }
     }
 
-    private fun parseMoexFuturesExpiry(figi: String): java.time.LocalDate? {
-        // FUTNASD12260 → month=12, year=2026
-        // FNASD0327000 → month=03, year=2027
-        val match = Regex("F(?:UT)?NASD(\\d{2})(\\d{2})\\d+").find(figi) ?: return null
-        val month = match.groupValues[1].toIntOrNull() ?: return null
-        val year2 = match.groupValues[2].toIntOrNull() ?: return null
-        val year = 2000 + year2
-        if (month !in 1..12 || year < 2024) return null
-        // Примерная дата экспирации: 3-я пятница месяца
-        return java.time.LocalDate.of(year, month, 1).with(java.time.temporal.TemporalAdjusters.dayOfWeekInMonth(3, java.time.DayOfWeek.FRIDAY))
+    fun findNearestNasdaqFutures(): InstrumentInfo? {
+        return findBestNasdaqFutures().firstOrNull()
     }
+
+
 
     fun getFuturesMargin(figi: String): Double? {
         val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetFuturesMargin"
@@ -590,16 +577,24 @@ fun main(args: Array<String>) {
     val cash = tcs.getWithdrawLimits(accountId)
 
     // Считаем стоимость ценных бумаг
-    var securitiesValue = 0.0
+    var liquidSecuritiesValue = 0.0  // Акции, облигации, ETF — можно продать и купить фонд
+    var futuresValue = 0.0           // Фьючерсы — не ликвидные средства, отдельно
     for (pos in positions) {
-        securitiesValue += pos.quantity * (pos.curPrice ?: 0.0)
+        val value = pos.quantity * (pos.curPrice ?: 0.0)
+        if (pos.instrumentType.equals("FUTURES", ignoreCase = true)) {
+            futuresValue += value
+        } else {
+            liquidSecuritiesValue += value
+        }
     }
 
-    val totalAccountValue = securitiesValue + cash
+    // Для расчета покупки фонда ликвидности доступны: кэш + ликвидные бумаги
+    val liquidAssets = liquidSecuritiesValue + cash
 
-    println("  Ценных бумаг: %.2f руб".format(securitiesValue).replace(',', '.'))
     println("  Кэш: %.2f руб".format(cash).replace(',', '.'))
-    println("  ИТОГО: %.2f руб".format(totalAccountValue).replace(',', '.'))
+    println("  Ликвидные бумаги (ETF/акции/облигации): %.2f руб".format(liquidSecuritiesValue).replace(',', '.'))
+    println("  Фьючерсы (нельзя тратить): %.2f руб".format(futuresValue).replace(',', '.'))
+    println("  Доступно для инвестирования: %.2f руб".format(liquidAssets).replace(',', '.'))
     println("  Позиций: ${positions.size}")
 
     if (positions.isNotEmpty()) {
@@ -615,21 +610,54 @@ fun main(args: Array<String>) {
     println()
     println("  [3/5] Поиск фьючерса NASD...")
 
-    // Ищем NASDAQ фьючерсы через Futures endpoint
-    val nasdInstrument = tcs.findNearestNasdaqFutures()
+    // Проверяем, есть ли уже NASD фьючерсы в портфеле
+    val existingNasdFutures = positions.filter {
+        it.instrumentType.equals("FUTURES", ignoreCase = true) && it.figi.contains("NASD", ignoreCase = true)
+    }
 
-    if (nasdInstrument == null) {
-        // Fallback: пробуем FindInstrument
+    var existingFuturesCount = 0
+    var existingFuturesFigi = ""
+    var existingFuturesAvgPrice = 0.0
+
+    if (existingNasdFutures.isNotEmpty()) {
+        println("  [INFO] В портфеле уже есть NASD фьючерсы:")
+        for (pos in existingNasdFutures) {
+            println("    - ${pos.ticker} (${pos.figi}): ${pos.quantity} шт, средняя цена: ${"%.2f".format(pos.avgPrice ?: 0.0)} руб.")
+            existingFuturesCount += pos.quantity.toInt()
+            existingFuturesFigi = pos.figi
+            existingFuturesAvgPrice = pos.avgPrice ?: 0.0
+        }
+        println("  Итого NASD фьючерсов в портфеле: $existingFuturesCount шт.")
+    }
+
+    // Ищем NASDAQ фьючерсы через Futures endpoint
+    val availableFutures = tcs.findBestNasdaqFutures()
+
+    if (availableFutures.isEmpty()) {
         println("  Futures endpoint не вернул результат, пробуем FindInstrument...")
         val alt = tcs.findInstrument("NASD") ?: tcs.findInstrument("NQ")
         if (alt != null && alt.classCode != "FAKEFAKE") {
             println("  Найден: ${alt.ticker} (${alt.figi}) class=${alt.classCode} exp=${alt.maturityDate}")
+            // Добавляем в список для выбора
         } else {
             println("  [ERROR] Фьючерс NASD не найден. Укажите тикер в application.properties: nasd.ticker, nasd.classCode, nasd.figi")
             kotlin.system.exitProcess(1)
         }
     }
-    println("  Контракт: ${nasdInstrument!!.ticker} (${nasdInstrument.figi})")
+
+    // Выбираем самый выгодный контракт
+    val nasdInstrument = if (availableFutures.size > 1) {
+        println("  [INFO] Доступно ${availableFutures.size} контрактов, выбираю наиболее выгодный...")
+        selectBestFuturesContract(availableFutures, tcs) ?: availableFutures.first()
+    } else {
+        availableFutures.firstOrNull() ?: tcs.findInstrument("NASD")
+    }
+
+    if (nasdInstrument == null) {
+        println("  [ERROR] Не удалось найти подходящий фьючерс NASD")
+        kotlin.system.exitProcess(1)
+    }
+    println("  Выбран контракт: ${nasdInstrument.ticker} (${nasdInstrument.figi})")
 
     println("  [4/5] Получение рыночных котировок...")
 
@@ -661,13 +689,32 @@ fun main(args: Array<String>) {
     println()
     println("  [5/5] Расчет оптимальной структуры портфеля...")
     println()
-    calculatePortfolioStructure(totalAccountValue, fullContractCostRur, singleContractGoRur)
+
+    // Вызываем расчет с учетом текущих позиций по фьючерсам
+    // totalAccountValue = liquidAssets (кэш + ликвидные бумаги), фьючерсы не считаются
+    calculatePortfolioStructure(
+        totalAccountValue = liquidAssets,
+        fullContractCostRur = fullContractCostRur,
+        singleContractGoRur = singleContractGoRur,
+        existingFuturesCount = existingFuturesCount,
+        existingFuturesFigi = existingFuturesFigi,
+        existingFuturesAvgPrice = existingFuturesAvgPrice
+    )
 }
 
+/**
+ * Рассчитывает оптимальную структуру портфеля с учетом:
+ * - Текущих позиций по фьючерсам (ребалансировка)
+ * - Выбора наиболее выгодного контракта
+ * - Безопасности маржинальных требований
+ */
 fun calculatePortfolioStructure(
     totalAccountValue: Double,
     fullContractCostRur: Double,
-    singleContractGoRur: Double
+    singleContractGoRur: Double,
+    existingFuturesCount: Int = 0,
+    existingFuturesFigi: String = "",
+    existingFuturesAvgPrice: Double = 0.0
 ) {
     val total = BigDecimal.valueOf(totalAccountValue)
     val contractCost = BigDecimal.valueOf(fullContractCostRur)
@@ -677,11 +724,14 @@ fun calculatePortfolioStructure(
     val targetCash = total.multiply(CASH_TARGET_PERCENT)
     val targetLiquidityFund = total.subtract(targetCash)
 
-    // 2. Расчет количества фьючерсов строго по правилу 1х (Без плеча)
-    val safeFuturesCount = total.divide(contractCost, 0, RoundingMode.DOWN).toInt()
+    // 2. Расчет целевого количества фьючерсов
+    val targetFuturesCount = total.divide(contractCost, 0, RoundingMode.DOWN).toInt()
 
-    // 3. Проверка маржинальных лимитов и безопасности
-    val totalRequiredGo = go.multiply(BigDecimal.valueOf(safeFuturesCount.toLong()))
+    // 3. Учет уже имеющихся фьючерсов в портфеле
+    val futuresDifference = targetFuturesCount - existingFuturesCount
+
+    // 4. Проверка маржинальных лимитов и безопасности
+    val totalRequiredGo = go.multiply(BigDecimal.valueOf(targetFuturesCount.toLong()))
     val fundCollateralValue = targetLiquidityFund.multiply(BigDecimal.ONE.subtract(BROKER_COLLATERAL_DISCOUNT))
 
     // Вывод структурированного отчета
@@ -692,10 +742,35 @@ fun calculatePortfolioStructure(
     println("  Стоимость 1 контракта NASD: ${contractCost.setScale(2, RoundingMode.HALF_UP)} руб.")
     println("  ГО 1 контракта: ${go.setScale(2, RoundingMode.HALF_UP)} руб.")
     println("----------------------------------------------------------------")
+
+    // Блок учета текущих позиций
+    if (existingFuturesCount > 0) {
+        println("  ТЕКУЩАЯ ПОЗИЦИЯ В ПОРТФЕЛЕ:")
+        println("  - Фьючерсов NASD уже есть: $existingFuturesCount шт.")
+        println("  - Средняя цена входа: ${"%.2f".format(existingFuturesAvgPrice)} руб.")
+        println("  - FIGI текущего контракта: $existingFuturesFigi")
+        println("----------------------------------------------------------------")
+    }
+
     println("  ИДЕАЛЬНОЕ РАСПРЕДЕЛЕНИЕ АКТИВОВ ДЛЯ ВВОДА В ТЕРМИНАЛ:")
     println("  1. Оставить в КЭШЕ (чистые рубли): ${targetCash.setScale(2, RoundingMode.HALF_UP)} руб.")
     println("  2. Купить ФОНД ЛИКВИДНОСТИ (TMON): ${targetLiquidityFund.setScale(2, RoundingMode.HALF_UP)} руб.")
-    println("  3. Удерживать ФЬЮЧЕРСОВ NASD: $safeFuturesCount шт.")
+    println("  3. Удерживать ФЬЮЧЕРСОВ NASD: $targetFuturesCount шт.")
+
+    // Блок ребалансировки
+    println("----------------------------------------------------------------")
+    if (futuresDifference > 0) {
+        println("  РЕБАЛАНСИРОВКА ТРЕБУЕТСЯ:")
+        println("  [!!!] Нужно ДОКУПИТЬ: $futuresDifference шт. фьючерсов NASD")
+        println("        Стоимость докупки: ${contractCost.multiply(BigDecimal.valueOf(futuresDifference.toLong())).setScale(2, RoundingMode.HALF_UP)} руб.")
+    } else if (futuresDifference < 0) {
+        println("  РЕБАЛАНСИРОВКА ТРЕБУЕТСЯ:")
+        println("  [!!!] Нужно ПРОДАТЬ: ${-futuresDifference} шт. фьючерсов NASD")
+        println("        Получите: ${contractCost.multiply(BigDecimal.valueOf((-futuresDifference).toLong())).setScale(2, RoundingMode.HALF_UP)} руб.")
+    } else {
+        println("  [OK] Портфель сбалансирован. Действия не требуются.")
+    }
+
     println("----------------------------------------------------------------")
     println("  АНАЛИЗ БЕЗОПАСНОСТИ МАРЖИНАЛЬНЫХ ТРЕБОВАНИЙ:")
     println("  - Заблокировано под ГО фьючерсов: ${totalRequiredGo.setScale(2, RoundingMode.HALF_UP)} руб.")
@@ -718,5 +793,85 @@ fun calculatePortfolioStructure(
     println("    продать часть фонда ликвидности для восстановления 10% кэша.")
     println("================================================================")
 }
+
+/**
+ * Выбирает самый выгодный NASDAQ фьючерс из доступных.
+ * Критерии выгоды:
+ * 1. Достаточная ликвидность (проверяется через объем торгов)
+ * 2. Оптимальное ГО (не слишком дорогое)
+ * 3. Достаточный срок до экспирации (не менее 30 дней)
+ */
+
+fun parseMoexFuturesExpiry(figi: String): java.time.LocalDate? {
+    // FUTNASD12260 → month=12, year=2026
+    // FNASD0327000 → month=03, year=2027
+    val match = Regex("F(?:UT)?NASD(\\d{2})(\\d{2})\\d+").find(figi) ?: return null
+    val month = match.groupValues[1].toIntOrNull() ?: return null
+    val year2 = match.groupValues[2].toIntOrNull() ?: return null
+    val year = 2000 + year2
+    if (month !in 1..12 || year < 2024) return null
+    return java.time.LocalDate.of(year, month, 1).with(java.time.temporal.TemporalAdjusters.dayOfWeekInMonth(3, java.time.DayOfWeek.FRIDAY))
+}
+fun selectBestFuturesContract(
+    futuresList: List<InstrumentInfo>,
+    client: TcsClient
+): InstrumentInfo? {
+    if (futuresList.isEmpty()) return null
+
+    val today = LocalDate.now()
+    val minDaysToExpiry = 30  // Минимум 30 дней до экспирации
+
+    // Фильтруем по минимальному сроку
+    val viableFutures = futuresList.mapNotNull { inst ->
+        val expiry = parseMoexFuturesExpiry(inst.figi)
+        if (expiry != null && expiry.isAfter(today.plusDays(minDaysToExpiry.toLong()))) {
+            Triple(inst, expiry, java.time.temporal.ChronoUnit.DAYS.between(today, expiry))
+        } else null
+    }
+
+    if (viableFutures.isEmpty()) {
+        println("  [WARN] Нет фьючерсов с достаточным сроком до экспирации (>${minDaysToExpiry} дней)")
+        // Fallback: берем ближайший
+        return futuresList.firstOrNull()
+    }
+
+    // Получаем ГО для каждого кандидата и оцениваем выгодность
+    var bestContract: InstrumentInfo? = null
+    var bestScore = Double.MIN_VALUE
+
+    println("  Анализ доступных контрактов:")
+    for ((inst, expiry, daysToExpiry) in viableFutures) {
+        val go = client.getFuturesMargin(inst.figi)
+        val goValue = go ?: 0.0
+
+        // Формула оценки выгодности:
+        // - Чем меньше ГО относительно стоимости контракта, тем лучше
+        // - Чем больше дней до экспирации, тем лучше (но не слишком)
+        val price = client.getLastPrices(listOf(inst.figi))[inst.figi] ?: 0.0
+        val goRatio = if (price > 0) goValue / price else 1.0
+
+        // Оптимальный срок: 30-90 дней (пенальти за слишком долгий срок)
+        val optimalDays = 60.0
+        val daysFactor = if (daysToExpiry <= optimalDays) {
+            1.0  // Идеально
+        } else {
+            1.0 - (daysToExpiry - optimalDays) / 365.0 * 0.5  // Штраф за долгий срок
+        }
+
+        // Итоговая оценка: чем выше, тем лучше
+        val score = (1.0 - goRatio) * 0.6 + daysFactor * 0.4
+
+        println("    ${inst.ticker} (${inst.figi}): exp=$expiry, дн=$daysToExpiry, ГО=$goValue, оценка=${"%.3f".format(score)}")
+
+        if (score > bestScore) {
+            bestScore = score
+            bestContract = inst
+        }
+    }
+
+    return bestContract
+}
+
+
 
 main(args)
