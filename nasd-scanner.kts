@@ -124,13 +124,18 @@ class TcsClient(private val apiKey: String) {
                 if (resp.statusCode() == 429) {
                     val wait = if (attempt < retries) 3L else 0L
                     println("  [WARN] Rate limit (429), попытка $attempt/$retries, жду ${wait}0 сек...")
+                    println("  [WARN] Request: $url")
+                    println("  [WARN] Request body: $body")
                     Thread.sleep(wait * 1000L)
                     continue
                 }
 
                 if (resp.statusCode() != 200) {
                     if (attempt == retries) {
-                        println("  [WARN] HTTP ${resp.statusCode()} (body: ${body.take(60)}...)")
+                        println("  [ERROR] HTTP ${resp.statusCode()}")
+                        println("  [ERROR] Request: $url")
+                        println("  [ERROR] Request body: $body")
+                        println("  [ERROR] Response: ${resp.body()}")
                         return null
                     }
                     Thread.sleep(2000L)
@@ -141,7 +146,10 @@ class TcsClient(private val apiKey: String) {
                 return resp.body()
             } catch (e: Exception) {
                 if (attempt == retries) {
-                    println("  [WARN] TCS API error: ${e.message}")
+                    println("  [ERROR] TCS API exception: ${e.javaClass.simpleName}: ${e.message}")
+                    println("  [ERROR] Request: $url")
+                    println("  [ERROR] Request body: $body")
+                    e.printStackTrace()
                     return null
                 }
                 Thread.sleep(2000L)
@@ -298,12 +306,12 @@ class TcsClient(private val apiKey: String) {
         val priceField = if (price != null && orderType == "ORDER_TYPE_LIMIT") {
             """, "price": {"units": "${price.toLong()}", "nano": ${(price % 1 * 1_000_000_000).toLong()}}"""
         } else ""
-        // Приоритет: uid > figi > ticker+classCode
+        // Приоритет: ticker+classCode > figi > uid
         val instrumentId = when {
+            ticker.isNotEmpty() && classCode.isNotEmpty() -> """, "instrumentId": "${ticker}_${classCode}""""
+            figi.isNotEmpty() -> """, "instrumentId": "$figi""""
             uid.isNotEmpty() -> """, "instrumentId": "$uid""""
-            figi.isNotEmpty() -> """, "figi": "$figi""""
-            ticker.isNotEmpty() && classCode.isNotEmpty() -> """, "ticker": "$ticker", "classCode": "$classCode""""
-            else -> """, "figi": "$figi""""
+            else -> """, "instrumentId": "${ticker}_${classCode}""""
         }
         val body = """{"accountId": "$accountId"$instrumentId, "quantity": $quantity, "direction": "$direction", "orderType": "$orderType"$priceField, "orderId": "${System.currentTimeMillis()}"}"""
         val idDesc = when {
@@ -318,6 +326,7 @@ class TcsClient(private val apiKey: String) {
         val rejects = extractString(json, "rejectReason")
         if (rejects.isNotEmpty()) {
             println("  [ERROR] Ордер отклонён: $rejects")
+            println("  [ERROR] Response: $json")
             return null
         }
         println("  [API] OrderId: $orderId")
@@ -864,20 +873,24 @@ fun main(args: Array<String>) {
 
     // Поиск LQDT по ISIN
     val lqdtIsin = "RU000A1014L8"
+    val lqdtFigiDefault = "TCS60A1014L8"
+    val lqdtClassCodeDefault = "SPBRU"
     val lqdtInstrument = tcs.findByIsin(lqdtIsin)
-    val lqdtTicker: String
-    val lqdtClassCode: String
+    val lqdtTicker = "LQDT"
+    val lqdtClassCode = lqdtClassCodeDefault
+    val lqdtFigi = lqdtFigiDefault
+    val lqdtUid = lqdtInstrument?.uid ?: ""
     if (lqdtInstrument != null) {
-        lqdtTicker = lqdtInstrument.ticker
-        lqdtClassCode = lqdtInstrument.classCode
-        println("  LQDT ISIN $lqdtIsin -> ticker: ${lqdtTicker}, classCode: ${lqdtClassCode}, uid: ${lqdtInstrument.uid}")
+        println("  LQDT ISIN $lqdtIsin -> ticker: $lqdtTicker, classCode: $lqdtClassCode, figi: $lqdtFigi, uid: $lqdtUid")
     } else {
-        lqdtTicker = "LQDT"
-        lqdtClassCode = ""
-        println("  [WARN] ISIN $lqdtIsin не найден, используем ticker по умолчанию: $lqdtTicker")
+        println("  [WARN] ISIN $lqdtIsin не найден в API, используем данные по умолчанию: ticker=$lqdtTicker, figi=$lqdtFigi, classCode=$lqdtClassCode")
     }
-    // Для цен: NASD по FIGI, LQDT по uid
-    val lqdtPriceId = if (lqdtInstrument != null && lqdtInstrument.uid.isNotEmpty()) lqdtInstrument.uid else lqdtIsin
+    // Для цен: NASD по FIGI, LQDT по uid → figi → ISIN
+    val lqdtPriceId = when {
+        lqdtUid.isNotEmpty() -> lqdtUid
+        lqdtFigi.isNotEmpty() -> lqdtFigi
+        else -> lqdtIsin
+    }
     val prices = tcs.getLastPrices(listOf(nasdInstrument.figi, lqdtPriceId))
 
     val nasdPrice = prices[nasdInstrument.figi]
@@ -890,9 +903,9 @@ fun main(args: Array<String>) {
     println("  Цена NASD: %.2f руб".format(nasdPrice).replace(',', '.'))
 
     val tmonPrice = prices[lqdtPriceId]
-        ?: tcs.getCandlesByUid(lqdtInstrument?.uid ?: "")
+        ?: if (lqdtUid.isNotEmpty()) tcs.getCandlesByUid(lqdtUid) else null
     if (tmonPrice == null) {
-        println("  [ERROR] Не удалось получить цену LQDT (uid: ${lqdtInstrument?.uid})")
+        println("  [ERROR] Не удалось получить цену LQDT (uid: $lqdtUid)")
         kotlin.system.exitProcess(1)
     }
     println("  Цена LQDT: %.2f руб".format(tmonPrice).replace(',', '.'))
@@ -929,8 +942,9 @@ fun main(args: Array<String>) {
         futuresTicker = nasdInstrument.ticker,
         futuresFigi = nasdInstrument.figi,
         lqdtTicker = lqdtTicker,
+        lqdtFigi = lqdtFigi,
         lqdtClassCode = lqdtClassCode,
-        lqdtUid = lqdtInstrument?.uid ?: "",
+        lqdtUid = lqdtUid,
         lqdtPrice = tmonPrice,
         currentCash = cash,
         currentLqdtValue = liquidSecuritiesValue
@@ -964,6 +978,7 @@ fun calculatePortfolioStructure(
     futuresTicker: String,
     futuresFigi: String,
     lqdtTicker: String,
+    lqdtFigi: String,
     lqdtClassCode: String,
     lqdtUid: String,
     lqdtPrice: Double,
@@ -1041,7 +1056,7 @@ fun calculatePortfolioStructure(
             val lqdtSellValue = deficit
             val lqdtSellQty = if (lqdtPrice > 0) (lqdtSellValue / lqdtPrice).toInt().coerceAtLeast(1) else 0
 
-            println("        Кэша不够: нужно ${"%.2f".format(requiredGoD)} руб., есть ${"%.2f".format(currentCash)} руб.")
+            println("        Кэша недостаточно: нужно ${"%.2f".format(requiredGoD)} руб., есть ${"%.2f".format(currentCash)} руб.")
             println("        Источник: продать ${lqdtSellQty} шт. LQDT + весь кэш")
 
             // Сначала покупаем фьючерсы
@@ -1058,7 +1073,7 @@ fun calculatePortfolioStructure(
             if (lqdtSellQty > 0) {
                 actions.add(RebalanceAction(
                     type = "SELL_LQDT",
-                    figi = "",
+                    figi = lqdtFigi,
                     ticker = lqdtTicker,
                     classCode = lqdtClassCode,
                     uid = lqdtUid,
@@ -1102,7 +1117,7 @@ fun calculatePortfolioStructure(
             // Добавляем действие: покупка LQDT
             actions.add(RebalanceAction(
                 type = "BUY_LQDT",
-                figi = "",
+                figi = lqdtFigi,
                 ticker = lqdtTicker,
                 classCode = lqdtClassCode,
                 uid = lqdtUid,
@@ -1116,7 +1131,7 @@ fun calculatePortfolioStructure(
             // Добавляем действие: продажа LQDT
             actions.add(RebalanceAction(
                 type = "SELL_LQDT",
-                figi = "",
+                figi = lqdtFigi,
                 ticker = lqdtTicker,
                 classCode = lqdtClassCode,
                 uid = lqdtUid,
@@ -1145,7 +1160,7 @@ fun calculatePortfolioStructure(
             println("        Кэш: ${"%.2f".format(currentCash)} руб., целевой: ${"%.2f".format(targetCashD)} руб.")
             actions.add(RebalanceAction(
                 type = "BUY_LQDT",
-                figi = "",
+                figi = lqdtFigi,
                 ticker = lqdtTicker,
                 classCode = lqdtClassCode,
                 uid = lqdtUid,
@@ -1163,7 +1178,7 @@ fun calculatePortfolioStructure(
             println("        Кэш: ${"%.2f".format(currentCash)} руб., целевой: ${"%.2f".format(targetCashD)} руб.")
             actions.add(RebalanceAction(
                 type = "SELL_LQDT",
-                figi = "",
+                figi = lqdtFigi,
                 ticker = lqdtTicker,
                 classCode = lqdtClassCode,
                 uid = lqdtUid,
@@ -1193,7 +1208,6 @@ fun calculatePortfolioStructure(
     println()
     println("  КАК РАБОТАЕТ СТРАТЕГИЯ ПРИ ПРОСАДКЕ:")
     println("  - Кэш в 10% постепенно тает, превращаясь в вариационную маржу.")
-    println("  - Раз в месяц перезапустите калькулятор с актуальными данными.")
     println("  - Если кэш упал (например, до 4%), программа порекомендует")
     println("    продать часть фонда ликвидности для восстановления 10% кэша.")
     println("================================================================")
