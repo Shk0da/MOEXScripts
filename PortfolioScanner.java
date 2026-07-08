@@ -17,14 +17,13 @@ import javax.net.ssl.*;
 public class PortfolioScanner {
 
     static final Properties props;
-    static final String TCS_API_KEY, FINAM_SECRET, FINAM_ACCOUNT_ID;
+    static final String TCS_API_KEY, FINAM_SECRET;
     static {
         props = new Properties();
         try { props.load(new FileInputStream(System.getProperty("user.dir") + "/application.properties")); }
         catch (Exception e) { System.out.println("  [WARN] loadProperties: " + e.getMessage()); }
         TCS_API_KEY = props.getProperty("tcs.apiKey", "");
         FINAM_SECRET = props.getProperty("finam.apiKey", "");
-        FINAM_ACCOUNT_ID = props.getProperty("finam.accountId", "");
     }
 
     // ── Data classes ─────────────────────────────────────────────────
@@ -752,12 +751,6 @@ public class PortfolioScanner {
                 String td = finam.getTokenDetails();
                 finamAccounts = extractFinamAccounts(td);
                 System.out.println("  Найдено счетов: " + finamAccounts.size());
-                if (!FINAM_ACCOUNT_ID.isEmpty()) {
-                    List<AccountInfo> filtered = new ArrayList<>();
-                    for (AccountInfo a : finamAccounts) { if (a.id.equals(FINAM_ACCOUNT_ID)) filtered.add(a); }
-                    finamAccounts = filtered;
-                    System.out.println("  (фильтр: только счёт " + FINAM_ACCOUNT_ID + ")");
-                }
             } else {
                 System.out.println("  [1/6] Finam API ключ не указан — работаем только с T-Invest");
                 System.out.println("  [2/6] Пропущено");
