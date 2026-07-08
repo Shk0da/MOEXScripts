@@ -42,7 +42,12 @@ data class BondConfig(
     val brokerCommission: Double = 0.0005,  // 0.05% комиссия брокера
     val capital: Double = 100_000.0,  // Капитал для инвестиций
     val minDaysToMaturity: Int = 90,  // Мин. дней до погашения
-    val maxDaysToMaturity: Int = 730  // Макс. дней до погашения (2 года)
+    val maxDaysToMaturity: Int = 730, // Макс. дней до погашения (2 года)
+    val autoMode: Boolean = false,   // Автоматическая покупка
+    val dryRun: Boolean = false,     // Режим dry run (без реальных сделок)
+    val accountId: String = "",      // ID аккаунта для торговли
+    val autoBuyCount: Int = 5,       // Кол-во облигаций для покупки в auto-режиме
+    val autoBuyAmount: Double = 0.0  // Сумма на покупку (0 = весь свободный кэш)
 )
 
 // Данные облигации
@@ -261,6 +266,177 @@ class TcsBondClient {
         .connectTimeout(Duration.ofSeconds(15))
         .sslContext(createTrustAllSSLContext())
         .build()
+
+    // Получить список открытых счетов
+    fun getAccounts(): List<TcsAccount> {
+        val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts"
+        val body = """{"status": "ACCOUNT_STATUS_OPEN"}"""
+        val json = postJson(url, body) ?: return emptyList()
+        return parseAccounts(json)
+    }
+
+    // Получить свободные средства
+    fun getWithdrawLimits(accountId: String): Double {
+        val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OperationsService/GetWithdrawLimits"
+        val body = """{"accountId": "$accountId"}"""
+        val json = postJson(url, body, retries = 2) ?: return 0.0
+        val totalCash = extractCashTotal(json)
+        val blocked = extractBlockedMargin(json)
+        return totalCash - blocked
+    }
+
+    // Разместить ордер на покупку облигации
+    fun postOrder(
+        accountId: String,
+        figi: String,
+        quantity: Long,
+        direction: String,
+        orderType: String = "ORDER_TYPE_MARKET",
+        price: Double? = null,
+        ticker: String = "",
+        classCode: String = ""
+    ): String? {
+        val url = "https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder"
+        val priceField = if (price != null && orderType == "ORDER_TYPE_LIMIT") {
+            """, "price": {"units": "${price.toLong()}", "nano": ${(price % 1 * 1_000_000_000).toLong()}}"""
+        } else ""
+        val instrumentId = if (ticker.isNotEmpty() && classCode.isNotEmpty()) {
+            """, "instrumentId": "${ticker}_${classCode}""""
+        } else {
+            """, "instrumentId": "$figi""""
+        }
+        val body = """{"accountId": "$accountId"$instrumentId, "quantity": $quantity, "direction": "$direction", "orderType": "$orderType"$priceField, "orderId": "${System.currentTimeMillis()}"}"""
+        println("  [API] PostOrder: $direction $quantity x ${ticker.ifEmpty { figi }}")
+        val json = postJson(url, body, retries = 2) ?: return null
+        val orderId = extractString(json, "orderId")
+        val rejects = extractString(json, "rejectReason")
+        if (rejects.isNotEmpty()) {
+            println("  [ERROR] Ордер отклонён: $rejects")
+            println("  [ERROR] Response: $json")
+            return null
+        }
+        println("  [API] OrderId: $orderId")
+        return orderId
+    }
+
+    // Парсинг счетов
+    private fun parseAccounts(json: String): List<TcsAccount> {
+        val accounts = mutableListOf<TcsAccount>()
+        val arrStart = json.indexOf("\"accounts\"")
+        if (arrStart < 0) return accounts
+        val bStart = json.indexOf('[', arrStart)
+        val bEnd = json.indexOf(']', bStart)
+        if (bStart < 0 || bEnd < 0) return accounts
+        val content = json.substring(bStart + 1, bEnd)
+        var depth = 0
+        var objStart = -1
+        for (i in content.indices) {
+            when (content[i]) {
+                '{' -> { if (depth == 0) objStart = i; depth++ }
+                '}' -> {
+                    depth--
+                    if (depth == 0 && objStart >= 0) {
+                        val obj = content.substring(objStart, i + 1)
+                        accounts.add(TcsAccount(
+                            id = extractString(obj, "id"),
+                            name = extractString(obj, "name"),
+                            type = extractString(obj, "type")
+                        ))
+                        objStart = -1
+                    }
+                }
+            }
+        }
+        return accounts
+    }
+
+    // Извлечение общей суммы кэша
+    private fun extractCashTotal(json: String): Double {
+        val moneyArr = json.indexOf("\"money\"")
+        if (moneyArr < 0) return 0.0
+        val bracketStart = json.indexOf('[', moneyArr)
+        val bracketEnd = json.indexOf(']', bracketStart)
+        if (bracketStart < 0 || bracketEnd < 0) return 0.0
+        val content = json.substring(bracketStart + 1, bracketEnd)
+        var depth = 0
+        var objStart = -1
+        var total = 0.0
+        for (i in content.indices) {
+            when (content[i]) {
+                '{' -> { if (depth == 0) objStart = i; depth++ }
+                '}' -> {
+                    depth--
+                    if (depth == 0 && objStart >= 0) {
+                        val obj = content.substring(objStart, i + 1)
+                        val currency = extractString(obj, "currency")
+                        val money = extractMoney(obj, "units") ?: 0.0
+                        val nano = Regex("\"nano\"\\s*:\\s*(\\d+)").find(obj)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                        val amount = money + nano / 1_000_000_000.0
+                        if (currency == "rub" || currency == "RUB") total += amount
+                        objStart = -1
+                    }
+                }
+            }
+        }
+        return total
+    }
+
+    // Извлечение заблокированной суммы (ГО)
+    private fun extractBlockedMargin(json: String): Double {
+        var total = 0.0
+        for (key in listOf("blockedGuarantee", "blocked")) {
+            val arr = json.indexOf("\"$key\"")
+            if (arr < 0) continue
+            var bracketStart = -1
+            for (i in arr until json.length) {
+                if (json[i] == '[') { bracketStart = i; break }
+            }
+            if (bracketStart < 0) continue
+            var bracketEnd = -1
+            var depth = 0
+            for (i in bracketStart until json.length) {
+                when (json[i]) {
+                    '[' -> depth++
+                    ']' -> { depth--; if (depth == 0) { bracketEnd = i; break } }
+                }
+            }
+            if (bracketEnd < 0) continue
+            val content = json.substring(bracketStart + 1, bracketEnd)
+            var objDepth = 0
+            var objStart = -1
+            for (i in content.indices) {
+                when (content[i]) {
+                    '{' -> { if (objDepth == 0) objStart = i; objDepth++ }
+                    '}' -> {
+                        objDepth--
+                        if (objDepth == 0 && objStart >= 0) {
+                            val obj = content.substring(objStart, i + 1)
+                            val currency = extractString(obj, "currency")
+                            val units = extractMoney(obj, "units") ?: 0.0
+                            val nano = Regex("\"nano\"\\s*:\\s*(\\d+)").find(obj)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                            val amount = units + nano / 1_000_000_000.0
+                            if (currency == "rub" || currency == "RUB") total += amount
+                            objStart = -1
+                        }
+                    }
+                }
+            }
+            if (total > 0) break
+        }
+        return total
+    }
+
+    // Извлечение денежного значения из JSON
+    private fun extractMoney(json: String, key: String): Double? {
+        val start = json.indexOf("\"$key\"")
+        if (start < 0) return null
+        val sub = json.substring(start)
+        val units = Regex("\"units\"\\s*:\\s*\"?(\\d+)\"?").find(sub)
+            ?.groupValues?.get(1)?.toLongOrNull() ?: return null
+        val nano = Regex("\"nano\"\\s*:\\s*(\\d+)").find(sub)
+            ?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+        return units + nano / 1_000_000_000.0
+    }
 
     // Получить список всех облигаций
     fun getAllBonds(): List<BondInstrument> {
@@ -765,7 +941,194 @@ class TcsBondClient {
         }
         return result
     }
+
+    // Данные по аккаунту
+    data class TcsAccount(val id: String, val name: String, val type: String)
 }
+
+// Клиент Finam API для торговли
+class FinamClient {
+    private val http = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(15))
+        .sslContext(createTrustAllSSLContext())
+        .build()
+    private var jwtToken: String? = null
+
+    fun authenticate(secret: String): String {
+        val url = "https://api.finam.ru/v1/sessions"
+        val body = """{"secret": "$secret"}"""
+        val resp = http.send(
+            HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build(),
+            HttpResponse.BodyHandlers.ofString()
+        )
+        if (resp.statusCode() != 200) {
+            throw Exception("Finam auth failed: HTTP ${resp.statusCode()} ${resp.body()}")
+        }
+        val token = extractJsonString(resp.body(), "token")
+        jwtToken = token
+        return token
+    }
+
+    fun getAccount(accountId: String): String {
+        val token = jwtToken ?: throw Exception("Not authenticated")
+        val url = "https://api.finam.ru/v1/accounts/$accountId"
+        val resp = http.send(
+            HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", "Bearer $token")
+                .GET()
+                .build(),
+            HttpResponse.BodyHandlers.ofString()
+        )
+        if (resp.statusCode() != 200) {
+            throw Exception("Finam get account failed: HTTP ${resp.statusCode()}")
+        }
+        return resp.body()
+    }
+
+    // Получить стакан по инструменту
+    fun getOrderBook(symbol: String): FinamOrderBook? {
+        val token = jwtToken ?: return null
+        val url = "https://api.finam.ru/v1/instruments/$symbol/orderbook"
+        return try {
+            val resp = http.send(
+                HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Authorization", "Bearer $token")
+                    .GET()
+                    .build(),
+                HttpResponse.BodyHandlers.ofString()
+            )
+            if (resp.statusCode() != 200) {
+                println("  [WARN] OrderBook $symbol: HTTP ${resp.statusCode()}")
+                return null
+            }
+            parseOrderBook(resp.body())
+        } catch (e: Exception) {
+            println("  [WARN] OrderBook $symbol: ${e.message}")
+            null
+        }
+    }
+
+    // Разместить лимитный ордер на покупку
+    fun placeLimitBuyOrder(accountId: String, symbol: String, quantity: String, price: String): String? {
+        val token = jwtToken ?: throw Exception("Not authenticated")
+        val url = "https://api.finam.ru/v1/accounts/$accountId/orders"
+        // Формируем JSON без переносов строк для надежности
+        val body = "{\"symbol\":\"$symbol\",\"quantity\":{\"value\":\"$quantity\"},\"side\":\"SIDE_BUY\",\"type\":\"ORDER_TYPE_LIMIT\",\"time_in_force\":\"TIME_IN_FORCE_DAY\",\"limit_price\":{\"value\":\"$price\"}}"
+        println("  [Finam] BUY $quantity x $symbol @ $price")
+        return try {
+            val resp = http.send(
+                HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Authorization", "Bearer $token")
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .build(),
+                HttpResponse.BodyHandlers.ofString()
+            )
+            if (resp.statusCode() != 200) {
+                println("  [ERROR] PlaceOrder: HTTP ${resp.statusCode()} ${resp.body()}")
+                return null
+            }
+            val orderId = extractJsonString(resp.body(), "orderId")
+            println("  [Finam] OrderId: $orderId")
+            orderId
+        } catch (e: Exception) {
+            println("  [ERROR] PlaceOrder: ${e.message}")
+            null
+        }
+    }
+
+    private fun extractJsonString(json: String, key: String): String {
+        val match = Regex("\"$key\"\\s*:\\s*\"([^\"]*)\"").find(json)
+        return match?.groupValues?.get(1) ?: ""
+    }
+
+    private fun parseOrderBook(json: String): FinamOrderBook? {
+        val bids = mutableListOf<FinamOrderBookEntry>()
+        val asks = mutableListOf<FinamOrderBookEntry>()
+
+        // Finam API формат: {"orderbook": {"rows": [{"price": {"value": "87.67"}, "sell_size": {"value": "82.0"}, ...}]}}
+        // Ищем массив rows
+        val rowsStart = json.indexOf("\"rows\"")
+        if (rowsStart < 0) return FinamOrderBook(bids, asks)
+
+        // Находим начало массива [
+        var depth = 0
+        var inArray = false
+        var arrayStart = -1
+
+        for (i in rowsStart until json.length) {
+            val ch = json[i]
+            if (ch == '[' && !inArray) {
+                inArray = true
+                arrayStart = i
+            } else if (inArray) {
+                if (ch == '[') depth++
+                if (ch == ']') {
+                    depth--
+                    if (depth < 0) {
+                        val content = json.substring(arrayStart + 1, i)
+                        parseOrderBookRows(content, bids, asks)
+                        break
+                    }
+                }
+            }
+        }
+
+        return FinamOrderBook(bids, asks)
+    }
+
+    private fun parseOrderBookRows(content: String, bids: MutableList<FinamOrderBookEntry>, asks: MutableList<FinamOrderBookEntry>) {
+        var depth = 0
+        var objStart = -1
+
+        for (i in content.indices) {
+            when (content[i]) {
+                '{' -> { if (depth == 0) objStart = i; depth++ }
+                '}' -> {
+                    depth--
+                    if (depth == 0 && objStart >= 0) {
+                        val obj = content.substring(objStart, i + 1)
+                        // Извлекаем цену из вложенного объекта {"value": "87.67"}
+                        val price = extractNestedValue(obj, "price")
+                        // Для ask: sell_size, для bid: buy_size
+                        val sellSize = extractNestedValue(obj, "sell_size")
+                        val buySize = extractNestedValue(obj, "buy_size")
+
+                        if (price.isNotEmpty()) {
+                            val priceVal = price.toDoubleOrNull() ?: 0.0
+                            if (sellSize.isNotEmpty() && sellSize.toDoubleOrNull() ?: 0.0 > 0) {
+                                asks.add(FinamOrderBookEntry(priceVal, sellSize.toDoubleOrNull() ?: 0.0))
+                            }
+                            if (buySize.isNotEmpty() && buySize.toDoubleOrNull() ?: 0.0 > 0) {
+                                bids.add(FinamOrderBookEntry(priceVal, buySize.toDoubleOrNull() ?: 0.0))
+                            }
+                        }
+                        objStart = -1
+                    }
+                }
+            }
+        }
+    }
+
+    // Извлечение значения из вложенного объекта: "key": {"value": "87.67"}
+    private fun extractNestedValue(json: String, key: String): String {
+        val keyIdx = json.indexOf("\"$key\"")
+        if (keyIdx < 0) return ""
+        val sub = json.substring(keyIdx)
+        val valueMatch = Regex("\"value\"\\s*:\\s*\"([^\"]+)\"").find(sub)
+        return valueMatch?.groupValues?.get(1) ?: ""
+    }
+}
+
+data class FinamOrderBookEntry(val price: Double, val quantity: Double)
+data class FinamOrderBook(val bids: List<FinamOrderBookEntry>, val asks: List<FinamOrderBookEntry>)
 
 // Сканер облигаций
 class BondScanner {
@@ -1116,7 +1479,12 @@ fun parseArgs(args: Array<String>): BondConfig {
     var capital = 100_000.0
     var minDays = 90
     var maxDays = 730
-    
+    var autoMode = false
+    var dryRun = false
+    var accountId = ""
+    var autoBuyCount = 5
+    var autoBuyAmount = 0.0
+
     var i = 0
     while (i < args.size) {
         when {
@@ -1160,6 +1528,26 @@ fun parseArgs(args: Array<String>): BondConfig {
                 maxDays = args[i + 1].toIntOrNull() ?: maxDays
                 i += 2
             }
+            args[i] == "--auto" -> {
+                autoMode = true
+                i++
+            }
+            args[i] == "--dry" -> {
+                dryRun = true
+                i++
+            }
+            args[i] == "--account-id" && i + 1 < args.size -> {
+                accountId = args[i + 1]
+                i += 2
+            }
+            args[i] == "--auto-count" && i + 1 < args.size -> {
+                autoBuyCount = args[i + 1].toIntOrNull() ?: autoBuyCount
+                i += 2
+            }
+            args[i] == "--auto-amount" && i + 1 < args.size -> {
+                autoBuyAmount = args[i + 1].toDoubleOrNull() ?: autoBuyAmount
+                i += 2
+            }
             args[i] == "--help" -> {
                 println("Использование: bond-scanner.kts [опции]")
                 println("Опции:")
@@ -1173,13 +1561,18 @@ fun parseArgs(args: Array<String>): BondConfig {
                 println("  --capital <value>        Капитал для инвестиций (по умолчанию: 100000)")
                 println("  --min-days <value>       Мин. дней до погашения (по умолчанию: 90)")
                 println("  --max-days <value>       Макс. дней до погашения (по умолчанию: 730)")
+                println("  --auto                   Автоматическая покупка лучших облигаций через Finam")
+                println("  --dry                    Режим dry run (без реальных сделок)")
+                println("  --account-id <id>        ID аккаунта Finam (или finam.accountId в properties)")
+                println("  --auto-count <value>     Кол-во облигаций для покупки (по умолчанию: 5)")
+                println("  --auto-amount <value>    Сумма на покупку (0 = весь свободный кэш)")
                 println("  --help                   Показать эту справку")
                 System.exit(0)
             }
             else -> i++
         }
     }
-    
+
     return BondConfig(
         targetYield = targetYield,
         couponFrequency = couponFreq,
@@ -1190,8 +1583,226 @@ fun parseArgs(args: Array<String>): BondConfig {
         maxBondsCount = maxCount,
         capital = capital,
         minDaysToMaturity = minDays,
-        maxDaysToMaturity = maxDays
+        maxDaysToMaturity = maxDays,
+        autoMode = autoMode,
+        dryRun = dryRun,
+        accountId = accountId,
+        autoBuyCount = autoBuyCount,
+        autoBuyAmount = autoBuyAmount
     )
+}
+
+// Комбинированный скор облигации (чем выше — тем лучше для покупки)
+// Учитывает: риск (вес 0.2), фундаментал (вес 0.3), YTM (вес 0.3), купонную доходность (вес 0.2)
+fun calculateBondBuyScore(bond: BondData): Double {
+    // Компонент 1: Риск (0-100, чем ниже риск — тем выше скор)
+    val riskScore = when (bond.riskLevel) {
+        "RISK_LEVEL_LOW" -> 100.0
+        "RISK_LEVEL_MODERATE" -> 70.0
+        "RISK_LEVEL_HIGH" -> 40.0
+        "RISK_LEVEL_VERY_HIGH" -> 10.0
+        else -> 50.0
+    }
+
+    // Компонент 2: Фундаментал (0-100)
+    val fundScore = if (bond.financialScore > 0) bond.financialScore * 20.0 else 50.0
+
+    // Компонент 3: YTM (0-100, нормализуем к диапазону 0-30%)
+    val ytmScore = (bond.ytm / 30.0 * 100.0).coerceIn(0.0, 100.0)
+
+    // Компонент 4: Купонная доходность (0-100, нормализуем к диапазону 0-25%)
+    val couponScore = (bond.currentYield / 25.0 * 100.0).coerceIn(0.0, 100.0)
+
+    return riskScore * 0.2 + fundScore * 0.3 + ytmScore * 0.3 + couponScore * 0.2
+}
+
+// Автоматическая покупка облигаций через Finam API
+fun executeAutoBuy(bonds: List<BondData>, config: BondConfig, props: java.util.Properties) {
+    println()
+    println("================================================================")
+    println("  АВТОМАТИЧЕСКАЯ ПОКУПКА ОБЛИГАЦИЙ")
+    println("================================================================")
+
+    // Инициализация Finam клиента
+    val finamSecret = props.getProperty("finam.apiKey", "")
+    if (finamSecret.isEmpty()) {
+        println("  [ERROR] Не настроен finam.apiKey в application.properties")
+        return
+    }
+
+    val finam = FinamClient()
+    try {
+        println("  [1/4] Авторизация в Finam API...")
+        finam.authenticate(finamSecret)
+        println("  [OK]")
+    } catch (e: Exception) {
+        println("  [ERROR] Ошибка авторизации Finam: ${e.message}")
+        return
+    }
+
+    // Определяем аккаунт
+    var accountId = config.accountId
+    if (accountId.isEmpty()) {
+        accountId = props.getProperty("finam.accountId", "")
+    }
+    if (accountId.isEmpty()) {
+        println("  [ERROR] Не указан --account-id и finam.accountId в properties")
+        return
+    }
+    println("  Аккаунт: $accountId")
+
+    // Получаем информацию об аккаунте и свободные средства
+    println("  [2/4] Получение информации об аккаунте...")
+    val accountJson = try {
+        finam.getAccount(accountId)
+    } catch (e: Exception) {
+        println("  [ERROR] Ошибка получения аккаунта: ${e.message}")
+        return
+    }
+
+    // Извлекаем свободные средства (available_cash)
+    val freeCash = extractFinamCash(accountJson)
+    println("  Свободные средства: ${"%.2f".format(freeCash)} руб.")
+
+    if (freeCash <= 0) {
+        println("  [WARN] Нет свободных средств для покупки")
+        return
+    }
+
+    // Сумма для покупки
+    val buyAmount = if (config.autoBuyAmount > 0) {
+        minOf(config.autoBuyAmount, freeCash)
+    } else {
+        freeCash
+    }
+    println("  Сумма на покупку: ${"%.2f".format(buyAmount)} руб.")
+
+    // Ранжируем облигации по комбинированному скору
+    println("  [3/4] Ранжирование облигаций...")
+    val ranked = bonds
+        .filter { it.price > 0 && it.ytm > 0 }
+        .sortedByDescending { calculateBondBuyScore(it) }
+        .take(config.autoBuyCount)
+
+    if (ranked.isEmpty()) {
+        println("  [WARN] Нет подходящих облигаций для покупки")
+        return
+    }
+
+    println("  Лучшие облигации для покупки:")
+    ranked.forEachIndexed { idx, bond ->
+        val score = calculateBondBuyScore(bond)
+        println("    ${idx + 1}. ${bond.ticker} — YTM: ${"%.1f".format(bond.ytm)}%, Купон: ${"%.1f".format(bond.currentYield)}%, Риск: ${RISK_TO_RATING[bond.riskLevel] ?: "?"}, Фин: ${bond.financialScore}/5, Скор: ${"%.1f".format(score)}")
+    }
+
+    // Распределяем сумму между облигациями
+    val perBond = buyAmount / ranked.size
+    println()
+    println("  [4/4] Размещение ордеров...")
+    if (config.dryRun) println("  *** DRY RUN — реальные ордера НЕ размещаются ***")
+    println("  На каждую облигацию: ${"%.2f".format(perBond)} руб.")
+    println()
+
+    var totalSpent = 0.0
+    var ordersPlaced = 0
+
+    for (bond in ranked) {
+        // Цена в процентах от номинала, номинал通常 1000 руб
+        val pricePerBond = bond.price * bond.nominal / 100.0
+        val quantity = (perBond / pricePerBond).toInt()
+
+        if (quantity <= 0) {
+            println("  [SKIP] ${bond.ticker}: недостаточно средств на 1 облигацию (${"%.2f".format(pricePerBond)} руб.)")
+            continue
+        }
+
+        // Формируем символ для Finam: ISIN@MISX (нужно найти ISIN по тикеру)
+        // Finam использует формат ticker@MIC, для облигаций это typically RU000A...@MISX
+        // Но у нас есть только тикер из T-Invest. Используем тикер класса
+        val symbol = "${bond.ticker}@MISX"
+
+        // Получаем стакан для определения лучшей цены покупки (ask)
+        val orderBook = finam.getOrderBook(symbol)
+        val buyPrice = if (orderBook != null && orderBook.asks.isNotEmpty()) {
+            // Берем лучшую цену покупки (самый дешевый ask)
+            orderBook.asks.minByOrNull { it.price }?.price ?: bond.price
+        } else {
+            // Фоллбэк на цену из T-Invest
+            bond.price
+        }
+
+        // Форматируем цену с точкой (не запятой) для Finam API
+        val priceFormatted = String.format(java.util.Locale.US, "%.2f", buyPrice)
+
+        println("  [BUY] ${bond.ticker}: $quantity шт. @ $priceFormatted% (стакан: ${if (orderBook != null) "ask=${orderBook.asks.minByOrNull { it.price }?.price ?: 0.0}" else "нет данных"})")
+
+        if (config.dryRun) {
+            // Dry run: только считаем стоимость, не размещаем ордер
+            val cost = quantity * buyPrice * bond.nominal / 100.0
+            totalSpent += cost
+            ordersPlaced++
+            println("  [DRY] Ордер пропущен (dry run), стоимость: ${"%.2f".format(cost)} руб.")
+        } else {
+            // Реальный ордер
+            val orderId = finam.placeLimitBuyOrder(
+                accountId = accountId,
+                symbol = symbol,
+                quantity = quantity.toString(),
+                price = priceFormatted
+            )
+
+            if (orderId != null) {
+                val cost = quantity * buyPrice * bond.nominal / 100.0
+                totalSpent += cost
+                ordersPlaced++
+                println("  [OK] Ордер размещён: $orderId, стоимость: ${"%.2f".format(cost)} руб.")
+            } else {
+                println("  [ERROR] Ордер не размещён для ${bond.ticker}")
+            }
+        }
+
+        Thread.sleep(200) // Задержка между ордерами
+    }
+
+    println()
+    println("================================================================")
+    println("  ИТОГО АВТОПОКУПКИ")
+    println("================================================================")
+    println("  Ордеров размещено: $ordersPlaced")
+    println("  Потрачено: ${"%.2f".format(totalSpent)} руб.")
+    println("  Остаток: ${"%.2f".format(buyAmount - totalSpent)} руб.")
+    println("================================================================")
+}
+
+// Извлечение значения из вложенного объекта: "key": {"value": "87.67"}
+fun extractNestedValue(json: String, key: String): String {
+    val keyIdx = json.indexOf("\"$key\"")
+    if (keyIdx < 0) return ""
+    val sub = json.substring(keyIdx)
+    val valueMatch = Regex("\"value\"\\s*:\\s*\"([^\"]+)\"").find(sub)
+    return valueMatch?.groupValues?.get(1) ?: ""
+}
+
+// Извлечение свободных средств из ответа Finam API
+// Finam API /v1/accounts/{id} возвращает:
+//   "available_cash": {"value": "380.27"} — доступный кэш для торговли
+//   "cash": [...] — массив валютных позиций (не свободные средства!)
+fun extractFinamCash(json: String): Double {
+    // Приоритет 1: available_cash (свободные средства для торговли)
+    val availMatch = Regex("\"available_cash\"\\s*:\\s*\\{\\s*\"value\"\\s*:\\s*\"([^\"]+)\"").find(json)
+    if (availMatch != null) {
+        return availMatch.groupValues[1].toDoubleOrNull() ?: 0.0
+    }
+
+    // Фоллбэк: ищем первый объект в массиве cash (если available_cash нет)
+    val cashStart = json.indexOf("\"cash\"")
+    if (cashStart < 0) return 0.0
+    val sub = json.substring(cashStart)
+    val units = Regex("\"units\"\\s*:\\s*\"?([\\d.]+)\"?").find(sub)
+        ?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
+    val nanos = Regex("\"nanos\"\\s*:\\s*(\\d+)").find(sub)
+        ?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+    return units + nanos / 1_000_000_000.0
 }
 
 // Main
@@ -1200,6 +1811,12 @@ fun main(args: Array<String>) {
     val scanner = BondScanner()
     val bonds = scanner.scan(config)
     printResults(bonds, config)
+
+    // Автоматическая покупка в auto-режиме
+    if (config.autoMode && bonds.isNotEmpty()) {
+        val props = loadProperties()
+        executeAutoBuy(bonds, config, props)
+    }
 }
 
 main(args)
