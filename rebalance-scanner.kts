@@ -51,6 +51,11 @@ fun extractString(json: String, key: String): String {
     return match?.groupValues?.get(1) ?: ""
 }
 
+fun extractInt(json: String, key: String): Int {
+    val match = Regex("\"$key\"\\s*:\\s*(\\d+)").find(json)
+    return match?.groupValues?.get(1)?.toIntOrNull() ?: 0
+}
+
 fun extractMoney(json: String, key: String): Double? {
     val start = json.indexOf("\"$key\"")
     if (start < 0) return null
@@ -161,7 +166,8 @@ data class InstrumentInfo(
     val instrumentType: String,
     val maturityDate: String = "",
     val isin: String = "",
-    val uid: String = ""
+    val uid: String = "",
+    val lot: Int = 1
 )
 
 /** Цель ребалансировки из tcs.rebalance */
@@ -219,12 +225,9 @@ class TcsClient(private val apiKey: String) {
                     continue
                 }
                 if (resp.statusCode() != 200) {
-                    if (attempt == retries) {
-                        println("  [ERROR] HTTP ${resp.statusCode()} — $url")
-                        return null
-                    }
-                    Thread.sleep(2000L)
-                    continue
+                    if (!silent) println("  [ERROR] HTTP ${resp.statusCode()} — $url")
+                    if (!silent) println("  [ERROR] Response: ${resp.body()}")
+                    return null
                 }
                 Thread.sleep(150L)
                 return resp.body()
@@ -312,9 +315,14 @@ class TcsClient(private val apiKey: String) {
         return Pair(bestBid, bestAsk)
     }
 
-    fun getOrderBookMidPrice(instrumentId: String): Double? {
-        val (bid, ask) = getOrderBookBestPrices(instrumentId) ?: return null
-        return (bid + ask) / 2.0
+    fun getOrderBookAskPrice(instrumentId: String): Double? {
+        val (_, ask) = getOrderBookBestPrices(instrumentId) ?: return null
+        return ask
+    }
+
+    fun getOrderBookBidPrice(instrumentId: String): Double? {
+        val (bid, _) = getOrderBookBestPrices(instrumentId) ?: return null
+        return bid
     }
 
     fun getLastPrices(instIds: List<String>): Map<String, Double> {
@@ -355,7 +363,13 @@ class TcsClient(private val apiKey: String) {
         val body = """{"accountId": "$accountId"$instrumentId, "quantity": $quantity, "direction": "$direction", "orderType": "$orderType"$priceField, "orderId": "${System.currentTimeMillis()}"}"""
         println("  [API] PostOrder: $direction $quantity x ${ticker.ifEmpty { figi }}")
         val json = post("https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder",
-            body, retries = 2) ?: return null
+            body, retries = 1) ?: return null
+        // Проверка на ошибку API
+        val errorMsg = extractString(json, "message")
+        if (errorMsg.isNotEmpty() && json.contains("\"code\"")) {
+            println("  [ERROR] API: $errorMsg")
+            return null
+        }
         val orderId = extractString(json, "orderId")
         val rejects = extractString(json, "rejectReason")
         if (rejects.isNotEmpty()) {
@@ -391,7 +405,8 @@ class TcsClient(private val apiKey: String) {
             instrumentType = extractString(inst, "instrumentType"),
             maturityDate = extractString(inst, "maturityDate"),
             isin = extractString(inst, "isin"),
-            uid = extractString(inst, "uid")
+            uid = extractString(inst, "uid"),
+            lot = extractInt(inst, "lot").coerceAtLeast(1)
         )
     }
 
@@ -405,7 +420,8 @@ class TcsClient(private val apiKey: String) {
                 instrumentType = extractString(inst, "instrumentType"),
                 maturityDate = extractString(inst, "maturityDate"),
                 isin = extractString(inst, "isin"),
-                uid = extractString(inst, "uid")
+                uid = extractString(inst, "uid"),
+                lot = extractInt(inst, "lot").coerceAtLeast(1)
             )
         }
     }
@@ -606,9 +622,9 @@ fun calculateRebalance(
         val instrumentId = "${instrument.ticker}_${instrument.classCode}"
 
         // Получаем цену из стакана
-        val midPrice = tcs.getOrderBookMidPrice(instrumentId)
+        val midPrice = tcs.getOrderBookAskPrice(instrumentId)
         val price = if (midPrice != null) {
-            println("    ${target.ticker}: стакан mid = ${"%.2f".format(midPrice)} руб.")
+            println("    ${target.ticker}: стакан ask = ${"%.2f".format(midPrice)} руб.")
             midPrice
         } else {
             // Фоллбэк на последнюю цену
@@ -641,9 +657,10 @@ fun calculateRebalance(
         val targetValue = totalPortfolioValue * target.weightPercent / 100.0
         val diffValue = currentValue - targetValue
 
-        // Количество лотов для покупки/продажи
+        // Количество лотов для покупки/продажи (делим на размер лота)
+        val lot = instrument?.lot ?: 1
         val diffQty = if (price > 0) {
-            (diffValue / price).toInt()  // положительное = продать, отрицательное = купить
+            (diffValue / price / lot).toInt()  // положительное = продать, отрицательное = купить
         } else 0
 
         analyses.add(InstrumentAnalysis(
@@ -671,18 +688,26 @@ fun calculateRebalance(
         tmonFigi.isNotEmpty() -> tmonFigi
         else -> "TMON@_SPBRU"
     }
-    val tmonPrice = tcs.getOrderBookMidPrice(tmonInstrumentId)
-        ?: tcs.getLastPrices(listOf(tmonInstrumentId))[tmonInstrumentId]
-        ?: (if (tmonUid.isNotEmpty()) tcs.getCandlesByUid(tmonUid) else null)
-        ?: 0.0
+    val tmonPrices = tcs.getOrderBookBestPrices(tmonInstrumentId)
+    var tmonBid = tmonPrices?.first ?: 0.0
+    var tmonAsk = tmonPrices?.second ?: 0.0
+    if (tmonAsk <= 0) {
+        val lp = tcs.getLastPrices(listOf(tmonInstrumentId))[tmonInstrumentId]
+        if (lp != null) { tmonBid = lp; tmonAsk = lp }
+    }
+    if (tmonAsk <= 0 && tmonUid.isNotEmpty()) {
+        val cp = tcs.getCandlesByUid(tmonUid)
+        if (cp != null) { tmonBid = cp; tmonAsk = cp }
+    }
+    if (tmonAsk <= 0) { tmonAsk = 1.0; tmonBid = 1.0 }
 
     if (tmonTargetWeight > 0) {
-        println("    TMON@: стакан mid = ${"%.2f".format(tmonPrice)} руб." +
-            if (tmonPrice <= 0) " [WARN] цена недоступна!" else "")
+        println("    TMON@: bid=${"%.2f".format(tmonBid)}, ask=${"%.2f".format(tmonAsk)} руб.")
     }
 
     val tmonDiffValue = tmonPositionValue - tmonTargetValue
-    val tmonDiffQty = if (tmonPrice > 0) (tmonDiffValue / tmonPrice).toInt() else 0
+    val tmonDiffQty = if (tmonDiffValue > 0 && tmonBid > 0) (tmonDiffValue / tmonBid).toInt()
+        else if (tmonDiffValue < 0 && tmonAsk > 0) (tmonDiffValue / tmonAsk).toInt() else 0
 
     // ─── Формирование действий ─────────────────────────────────────────
     // Правило: бумаги НЕ продаются. Для покупок продается TMON@ (денежный буфер).
@@ -694,7 +719,9 @@ fun calculateRebalance(
     var totalBuyAmount = 0.0
     for (a in analyses) {
         if (a.diffQty < 0 && a.instrument != null) {
-            val amount = (-a.diffQty) * a.currentPrice
+            val qty = -a.diffQty
+            val lot = a.instrument.lot
+            val amount = qty * lot * a.currentPrice
             totalBuyAmount += amount
             actions.add(RebalanceAction(
                 type = "BUY",
@@ -702,7 +729,7 @@ fun calculateRebalance(
                 figi = a.instrument.figi,
                 classCode = a.instrument.classCode,
                 uid = a.instrument.uid,
-                quantity = -a.diffQty,
+                quantity = qty,
                 price = a.currentPrice,
                 amount = amount
             ))
@@ -721,17 +748,18 @@ fun calculateRebalance(
         } else {
             // Кэша не хватает — продаем TMON@ на недостающую сумму
             val deficit = totalBuyAmount - availableCash
-            val tmonSellQty = if (tmonPrice > 0) (deficit / tmonPrice).toInt().coerceAtLeast(1) else 0
-            val tmonSellAmount = tmonSellQty * tmonPrice
+            val tmonMaxQty = tmonPosition?.quantity?.toInt() ?: 0
+            val tmonSellQty = if (tmonBid > 0) ((deficit / tmonBid).toInt().coerceAtLeast(1)).coerceAtMost(tmonMaxQty) else 0
+            val tmonSellAmount = tmonSellQty * tmonBid
 
             if (tmonSellQty > 0 && tmonSellAmount > 0) {
                 println("  [INFO] Кэша недостаточно: нужно ${fmt(totalBuyAmount)} р.," +
                     " есть ${fmt(availableCash)} р.")
-                println("  [INFO] Продаем ${tmonSellQty} шт. TMON@ на ${fmt(tmonSellAmount)} р.")
+                println("  [INFO] Продаем ${tmonSellQty} шт. TMON@ по bid ${fmt(tmonBid, 2)} р.")
                 actions.add(RebalanceAction(
                     type = "SELL", ticker = "TMON@", figi = tmonFigi,
                     classCode = tmonClassCode, uid = tmonUid,
-                    quantity = tmonSellQty, price = tmonPrice,
+                    quantity = tmonSellQty, price = tmonBid,
                     amount = tmonSellAmount
                 ))
             }
@@ -749,16 +777,18 @@ fun calculateRebalance(
     // 4. Если кэша осталось после покупок — докупаем TMON@
     val totalSellAmount = actions.filter { it.type == "SELL" }.sumOf { it.amount }
     val cashAfterBuysAndSells = availableCash + totalSellAmount - totalBuyAmount
-    if (cashAfterBuysAndSells > tmonPrice && tmonPrice > 0) {
-        val tmonBuyQty = (cashAfterBuysAndSells / tmonPrice).toInt()
-        val tmonBuyAmount = tmonBuyQty * tmonPrice
+    // Оставляем 2% запас на проскальзывание и комиссии
+    val safeCash = cashAfterBuysAndSells * 0.98
+    if (safeCash > tmonAsk && tmonAsk > 0) {
+        val tmonBuyQty = (safeCash / tmonAsk).toInt()
+        val tmonBuyAmount = tmonBuyQty * tmonAsk
         if (tmonBuyQty > 0) {
             println("  [INFO] Остаток кэша ${fmt(cashAfterBuysAndSells)} р." +
-                " → докупаем ${tmonBuyQty} шт. TMON@")
+                " → докупаем ${tmonBuyQty} шт. TMON@ по ask ${fmt(tmonAsk, 2)} р.")
             actions.add(RebalanceAction(
                 type = "BUY", ticker = "TMON@", figi = tmonFigi,
                 classCode = tmonClassCode, uid = tmonUid,
-                quantity = tmonBuyQty, price = tmonPrice,
+                quantity = tmonBuyQty, price = tmonAsk,
                 amount = tmonBuyAmount
             ))
         }
@@ -770,7 +800,7 @@ fun calculateRebalance(
             target = RebalanceTarget("ETF", "TMON@", tmonTargetWeight),
             instrument = tmonInstrument,
             currentQty = tmonPosition?.quantity ?: 0.0,
-            currentPrice = tmonPrice,
+            currentPrice = tmonAsk,
             currentValue = tmonPositionValue,
             targetValue = tmonTargetValue,
             diffValue = tmonDiffValue,
@@ -875,32 +905,97 @@ fun executeRebalancing(
     println("  ВЫПОЛНЕНИЕ РЕБАЛАНСИРОВКИ")
     println("================================================================")
 
-    // Сначала продажи
+    var cash = tcs.getWithdrawLimits(accountId)
+    println("  Свободный кэш: ${fmt(cash, 2)} руб.")
+
+    // 1. Продажи (свежая цена bid)
     val sells = actions.filter { it.type == "SELL" }
     for (a in sells) {
-        println("  [SELL] ${a.ticker}: ${a.quantity} шт по ${fmt(a.price, 2)} р.")
-        val orderId = tcs.postOrder(
-            accountId = accountId, figi = a.figi, quantity = a.quantity.toLong(),
-            direction = "ORDER_DIRECTION_SELL", orderType = "ORDER_TYPE_MARKET",
-            ticker = a.ticker, classCode = a.classCode, uid = a.uid
-        )
-        if (orderId != null) println("  [OK] Ордер: $orderId")
-        else println("  [WARN] Не удалось разместить ордер на продажу ${a.ticker}")
-        Thread.sleep(500)
+        val prices = tcs.getOrderBookBestPrices("${a.ticker}_${a.classCode}")
+        val bid = prices?.first ?: a.price
+        println("  [SELL] ${a.ticker}: ${a.quantity} шт по bid ${fmt(bid, 2)} р.")
+        val orderId = tcs.postOrder(accountId, a.figi, a.quantity.toLong(), "ORDER_DIRECTION_SELL", a.ticker, a.classCode, a.uid)
+        if (orderId != null) {
+            println("  [OK] Ордер: $orderId")
+            cash += a.quantity * bid
+            println("  [INFO] Кэш после продажи: ${fmt(cash, 2)} руб.")
+        } else {
+            println("  [WARN] Не удалось продать ${a.ticker}, кэш не изменился")
+        }
+        Thread.sleep(1000)
     }
 
-    // Затем покупки
+    // 2. Пересчитываем покупки пропорционально
     val buys = actions.filter { it.type == "BUY" }
-    for (a in buys) {
-        println("  [BUY] ${a.ticker}: ${a.quantity} шт по ${fmt(a.price, 2)} р.")
-        val orderId = tcs.postOrder(
-            accountId = accountId, figi = a.figi, quantity = a.quantity.toLong(),
-            direction = "ORDER_DIRECTION_BUY", orderType = "ORDER_TYPE_MARKET",
-            ticker = a.ticker, classCode = a.classCode, uid = a.uid
-        )
+    val stockBuys = buys.filter { it.ticker != "TMON@" }
+    val totalStockAmount = stockBuys.sumOf { it.amount }.coerceAtLeast(1.0)
+
+    println()
+    println("  --- План покупок (кэш: ${fmt(cash, 2)} руб.) ---")
+
+    val actualBuys = mutableListOf<RebalanceAction>()
+    val skippedBuys = mutableListOf<RebalanceAction>()
+    for (a in stockBuys) {
+        val prices = tcs.getOrderBookBestPrices("${a.ticker}_${a.classCode}")
+        val ask = prices?.second ?: a.price
+        val lot = if (a.lot > 0) a.lot else 1
+
+        val share = cash * (a.amount / totalStockAmount)
+        val qty = if (ask > 0 && lot > 0) (share / ask / lot).toInt().coerceAtLeast(0) else 0
+        if (qty <= 0) {
+            skippedBuys.add(RebalanceAction("BUY", a.ticker, a.figi, a.classCode, a.uid, 0, lot, ask, 0))
+            println("  [SKIP] ${a.ticker}: доля ${fmt(share, 2)} р., 1 лот=${fmt(ask * lot, 2)} р. (попробую из остатка)")
+            continue
+        }
+        val cost = qty * lot * ask
+        actualBuys.add(RebalanceAction("BUY", a.ticker, a.figi, a.classCode, a.uid, qty, lot, ask, cost))
+        cash -= cost
+        println("  [PLAN] ${a.ticker}: ${qty} лот(ов) (${qty * lot} шт) x ${fmt(ask, 2)} р. = ${fmt(cost, 2)} р. (остаток: ${fmt(cash, 2)} р.)")
+    }
+
+    // Повторная попытка для пропущенных бумаг из остатка кэша
+    if (skippedBuys.isNotEmpty() && cash > 0) {
+        println()
+        for (a in skippedBuys) {
+            val prices = tcs.getOrderBookBestPrices("${a.ticker}_${a.classCode}")
+            val ask = prices?.second ?: a.price
+            val lot = a.lot
+            val qty = if (ask > 0 && lot > 0) (cash / ask / lot).toInt().coerceAtLeast(0) else 0
+            if (qty <= 0) continue
+            val cost = qty * lot * ask
+            actualBuys.add(RebalanceAction("BUY", a.ticker, a.figi, a.classCode, a.uid, qty, lot, ask, cost))
+            cash -= cost
+            println("  [PLAN] ${a.ticker}: ${qty} лот(ов) (${qty * lot} шт) x ${fmt(ask, 2)} р. = ${fmt(cost, 2)} р. (остаток: ${fmt(cash, 2)} р.)")
+        }
+    }
+
+    // TMON@ — покупаем остаток кэша
+    if (cash > 160) {
+        val tmonPrices = tcs.getOrderBookBestPrices("TMON@_SPBRU")
+        val tmonAsk = tmonPrices?.second ?: 160.0
+        val safeCash = cash * 0.98
+        val tmonQty = (safeCash / tmonAsk).toInt()
+        if (tmonQty > 0) {
+            val cost = tmonQty * tmonAsk
+            actualBuys.add(RebalanceAction("BUY", "TMON@", "TCS70A106DL2", "SPBRU", "", tmonQty, 1, tmonAsk, cost))
+            println("  [PLAN] TMON@: ${tmonQty} шт x ${fmt(tmonAsk, 2)} р. = ${fmt(cost, 2)} р.")
+        }
+    }
+
+    if (actualBuys.isEmpty()) {
+        println("  [INFO] Нет достаточного кэша для покупок")
+        println("  [OK] Ребалансировка завершена.")
+        return
+    }
+
+    // 3. Исполняем план покупок
+    println()
+    for (a in actualBuys) {
+        println("  [BUY] ${a.ticker}: ${a.quantity} лот(ов) (${a.quantity * a.lot} шт) по ${fmt(a.price, 2)} р.")
+        val orderId = tcs.postOrder(accountId, a.figi, a.quantity.toLong(), "ORDER_DIRECTION_BUY", a.ticker, a.classCode, a.uid)
         if (orderId != null) println("  [OK] Ордер: $orderId")
-        else println("  [WARN] Не удалось разместить ордер на покупку ${a.ticker}")
-        Thread.sleep(500)
+        else println("  [WARN] Не удалось купить ${a.ticker}")
+        Thread.sleep(1000)
     }
 
     println("  [OK] Ребалансировка завершена.")

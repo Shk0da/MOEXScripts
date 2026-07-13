@@ -9,6 +9,8 @@ import java.security.cert.*;
 import java.time.*;
 import java.time.format.*;
 import java.util.*;
+import java.util.UUID;
+import java.util.concurrent.atomic.*;
 import java.util.regex.*;
 import javax.net.ssl.*;
 
@@ -43,8 +45,9 @@ public class RebalanceScanner {
 
     static class InstrumentInfo {
         final String figi, ticker, classCode, instrumentType, maturityDate, isin, uid;
-        InstrumentInfo(String f, String t, String cc, String it, String md, String i, String u) {
-            figi = f; ticker = t; classCode = cc; instrumentType = it; maturityDate = md; isin = i; uid = u;
+        final int lot;
+        InstrumentInfo(String f, String t, String cc, String it, String md, String i, String u, int l) {
+            figi = f; ticker = t; classCode = cc; instrumentType = it; maturityDate = md; isin = i; uid = u; lot = l;
         }
     }
 
@@ -66,10 +69,10 @@ public class RebalanceScanner {
 
     static class RebalanceAction {
         final String type, ticker, figi, classCode, uid;
-        final int quantity;
+        final int quantity, lot;
         final double price, amount;
-        RebalanceAction(String tp, String t, String f, String cc, String u, int q, double p, double a) {
-            type = tp; ticker = t; figi = f; classCode = cc; uid = u; quantity = q; price = p; amount = a;
+        RebalanceAction(String tp, String t, String f, String cc, String u, int q, int l, double p, double a) {
+            type = tp; ticker = t; figi = f; classCode = cc; uid = u; quantity = q; lot = l; price = p; amount = a;
         }
     }
 
@@ -96,6 +99,11 @@ public class RebalanceScanner {
     static String extractString(String json, String key) {
         Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*\"([^\"]*)\"").matcher(json);
         return m.find() ? m.group(1) : "";
+    }
+
+    static int extractInt(String json, String key) {
+        Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*(\\d+)").matcher(json);
+        return m.find() ? Integer.parseInt(m.group(1)) : 0;
     }
 
     static Double extractMoney(String json, String key) {
@@ -142,6 +150,7 @@ public class RebalanceScanner {
 
     static final HttpClient HTTP = createHttpClient();
 
+    /** POST с retry только на 429 (rate limit). На остальных ошибках — возвращает тело ответа. */
     static String post(String url, String body, int retries, boolean silent) {
         for (int attempt = 1; attempt <= retries; attempt++) {
             try {
@@ -159,12 +168,9 @@ public class RebalanceScanner {
                     continue;
                 }
                 if (resp.statusCode() != 200) {
-                    if (attempt == retries) {
-                        System.out.println("  [ERROR] HTTP " + resp.statusCode() + " — " + url);
-                        return null;
-                    }
-                    Thread.sleep(2000L);
-                    continue;
+                    if (!silent) System.out.println("  [ERROR] HTTP " + resp.statusCode() + " — " + url);
+                    if (!silent) System.out.println("  [ERROR] Response: " + resp.body());
+                    return null;
                 }
                 Thread.sleep(150L);
                 return resp.body();
@@ -220,10 +226,12 @@ public class RebalanceScanner {
         if (json == null) return Collections.emptyList();
         List<InstrumentInfo> result = new ArrayList<>();
         for (String inst : extractNestedArray(json, "instruments")) {
+            int lot = extractInt(inst, "lot");
+            if (lot < 1) lot = 1;
             result.add(new InstrumentInfo(
                 extractString(inst, "figi"), extractString(inst, "ticker"), extractString(inst, "classCode"),
                 extractString(inst, "instrumentType"), extractString(inst, "maturityDate"),
-                extractString(inst, "isin"), extractString(inst, "uid")));
+                extractString(inst, "isin"), extractString(inst, "uid"), lot));
         }
         return result;
     }
@@ -241,10 +249,16 @@ public class RebalanceScanner {
         return new double[]{bestBid, bestAsk};
     }
 
-    static Double getOrderBookMidPrice(String instrumentId) {
+    static Double getOrderBookAskPrice(String instrumentId) {
         double[] prices = getOrderBookBestPrices(instrumentId);
         if (prices == null) return null;
-        return (prices[0] + prices[1]) / 2.0;
+        return prices[1]; // ask = best sell price
+    }
+
+    static Double getOrderBookBidPrice(String instrumentId) {
+        double[] prices = getOrderBookBestPrices(instrumentId);
+        if (prices == null) return null;
+        return prices[0]; // bid = best buy price
     }
 
     static Map<String, Double> getLastPrices(List<String> instIds) {
@@ -281,15 +295,26 @@ public class RebalanceScanner {
         else if (!figi.isEmpty()) instrumentId = figi;
         else if (!uid.isEmpty()) instrumentId = uid;
         if (instrumentId.isEmpty()) return null;
-        String body = "{\"accountId\": \"" + accountId + "\", \"instrumentId\": \"" + instrumentId + "\", \"quantity\": " + quantity + ", \"direction\": \"" + direction + "\", \"orderType\": \"ORDER_TYPE_MARKET\", \"orderId\": \"" + System.currentTimeMillis() + "\"}";
+
+        String orderId = "" + System.currentTimeMillis();
+        String body = "{\"accountId\": \"" + accountId + "\", \"instrumentId\": \"" + instrumentId + "\", \"quantity\": " + quantity + ", \"direction\": \"" + direction + "\", \"orderType\": \"ORDER_TYPE_MARKET\", \"orderId\": \"" + orderId + "\"}";
         System.out.println("  [API] PostOrder: " + direction + " " + quantity + " x " + (ticker.isEmpty() ? figi : ticker));
-        String json = post("https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder", body, 2, false);
+        String json = post("https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder", body, 1, false);
         if (json == null) return null;
+
+        // Check for API error in response
+        String errorMsg = extractString(json, "message");
+        if (!errorMsg.isEmpty() && json.contains("\"code\"")) {
+            System.out.println("  [ERROR] API: " + errorMsg);
+            return null;
+        }
+
         String rejects = extractString(json, "rejectReason");
         if (!rejects.isEmpty()) {
             System.out.println("  [ERROR] Ордер отклонён: " + rejects);
             return null;
         }
+
         return extractString(json, "orderId");
     }
 
@@ -453,10 +478,10 @@ public class RebalanceScanner {
             String instrumentId = instrument.ticker + "_" + instrument.classCode;
 
             // Get price from order book
-            Double midPrice = getOrderBookMidPrice(instrumentId);
+            Double midPrice = getOrderBookAskPrice(instrumentId);
             double price;
             if (midPrice != null) {
-                System.out.printf("    %s: стакан mid = %.2f руб.\n", target.ticker, midPrice);
+                System.out.printf("    %s: стакан ask = %.2f руб.\n", target.ticker, midPrice);
                 price = midPrice;
             } else {
                 Map<String, Double> lastPrices = getLastPrices(Collections.singletonList(instrumentId));
@@ -486,7 +511,10 @@ public class RebalanceScanner {
             double currentValue = currentQty * currentPriceForVal;
             double targetValue = totalPortfolioValue * target.weightPercent / 100.0;
             double diffValue = currentValue - targetValue;
-            int diffQty = price > 0 ? (int)(diffValue / price) : 0;
+            int lot = instrument != null ? instrument.lot : 1;
+            int diffQty = price > 0 ? (int)(diffValue / price / lot) : 0;
+            // Если нужно купить, но целевая сумма < 1 лота — покупаем минимум 1 лот
+            if (diffQty == 0 && diffValue < 0) diffQty = -1;
 
             analyses.add(new InstrumentAnalysis(target, instrument, currentQty, price, currentValue, targetValue, diffValue, diffQty));
         }
@@ -497,20 +525,25 @@ public class RebalanceScanner {
         double tmonPositionValue = tmonPosition != null ? tmonPosition.quantity * (tmonPosition.curPrice > 0 ? tmonPosition.curPrice : 0.0) : 0.0;
 
         String tmonInstrumentId = !tmonUid.isEmpty() ? tmonUid : (!tmonFigi.isEmpty() ? tmonFigi : "TMON@_SPBRU");
-        Double tmonPrice = getOrderBookMidPrice(tmonInstrumentId);
-        if (tmonPrice == null) {
+        double[] tmonPrices = getOrderBookBestPrices(tmonInstrumentId);
+        double tmonBid = tmonPrices != null ? tmonPrices[0] : 0.0;
+        double tmonAsk = tmonPrices != null ? tmonPrices[1] : 0.0;
+        if (tmonAsk <= 0) {
             Map<String, Double> lastPrices = getLastPrices(Collections.singletonList(tmonInstrumentId));
-            tmonPrice = lastPrices.get(tmonInstrumentId);
+            Double lp = lastPrices.get(tmonInstrumentId);
+            if (lp != null) tmonAsk = tmonBid = lp;
         }
-        if (tmonPrice == null && !tmonUid.isEmpty()) tmonPrice = getCandlesByUid(tmonUid);
-        if (tmonPrice == null) tmonPrice = 0.0;
+        if (tmonAsk <= 0 && !tmonUid.isEmpty()) { tmonAsk = tmonBid = getCandlesByUid(tmonUid); }
+        if (tmonAsk <= 0) tmonAsk = tmonBid = 1.0;
 
         if (tmonTargetWeight > 0) {
-            System.out.printf("    TMON@: стакан mid = %.2f руб.%s\n", tmonPrice, tmonPrice <= 0 ? " [WARN] цена недоступна!" : "");
+            System.out.printf("    TMON@: bid=%.2f, ask=%.2f руб.\n", tmonBid, tmonAsk);
         }
 
         double tmonDiffValue = tmonPositionValue - tmonTargetValue;
-        int tmonDiffQty = tmonPrice > 0 ? (int)(tmonDiffValue / tmonPrice) : 0;
+        // Для продажи TMON@ — bid, для покупки — ask
+        int tmonDiffQty = tmonDiffValue > 0 && tmonBid > 0 ? (int)(tmonDiffValue / tmonBid) :
+                          tmonDiffValue < 0 && tmonAsk > 0 ? (int)(tmonDiffValue / tmonAsk) : 0;
 
         // Build actions
         List<RebalanceAction> actions = new ArrayList<>();
@@ -518,9 +551,11 @@ public class RebalanceScanner {
 
         for (InstrumentAnalysis a : analyses) {
             if (a.diffQty < 0 && a.instrument != null) {
-                double amount = (-a.diffQty) * a.currentPrice;
+                int qty = -a.diffQty;
+                int lot = a.instrument != null ? a.instrument.lot : 1;
+                double amount = qty * lot * a.currentPrice;
                 totalBuyAmount += amount;
-                actions.add(new RebalanceAction("BUY", a.target.ticker, a.instrument.figi, a.instrument.classCode, a.instrument.uid, -a.diffQty, a.currentPrice, amount));
+                actions.add(new RebalanceAction("BUY", a.target.ticker, a.instrument.figi, a.instrument.classCode, a.instrument.uid, -a.diffQty, lot, a.currentPrice, amount));
             }
         }
 
@@ -529,12 +564,13 @@ public class RebalanceScanner {
                 System.out.println("  [INFO] Кэша достаточно (" + fmt(cash) + " р.) для покупок на " + fmt(totalBuyAmount) + " р.");
             } else {
                 double deficit = totalBuyAmount - cash;
-                int tmonSellQty = tmonPrice > 0 ? Math.max((int)(deficit / tmonPrice), 1) : 0;
-                double tmonSellAmount = tmonSellQty * tmonPrice;
+                int tmonMaxQty = tmonPosition != null ? (int) tmonPosition.quantity : 0;
+                int tmonSellQty = tmonBid > 0 ? Math.min(Math.max((int)(deficit / tmonBid), 1), tmonMaxQty) : 0;
+                double tmonSellAmount = tmonSellQty * tmonBid;
                 if (tmonSellQty > 0 && tmonSellAmount > 0) {
                     System.out.println("  [INFO] Кэша недостаточно: нужно " + fmt(totalBuyAmount) + " р., есть " + fmt(cash) + " р.");
-                    System.out.println("  [INFO] Продаем " + tmonSellQty + " шт. TMON@ на " + fmt(tmonSellAmount) + " р.");
-                    actions.add(new RebalanceAction("SELL", "TMON@", tmonFigi, tmonClassCode, tmonUid, tmonSellQty, tmonPrice, tmonSellAmount));
+                    System.out.println("  [INFO] Продаем " + tmonSellQty + " шт. TMON@ по bid " + fmt(tmonBid, 2) + " р.");
+                    actions.add(new RebalanceAction("SELL", "TMON@", tmonFigi, tmonClassCode, tmonUid, tmonSellQty, 1, tmonBid, tmonSellAmount));
                 }
             }
         }
@@ -548,19 +584,21 @@ public class RebalanceScanner {
         double totalSellAmount = 0.0;
         for (RebalanceAction a : actions) { if (a.type.equals("SELL")) totalSellAmount += a.amount; }
         double cashAfterBuysAndSells = cash + totalSellAmount - totalBuyAmount;
-        if (cashAfterBuysAndSells > tmonPrice && tmonPrice > 0) {
-            int tmonBuyQty = (int)(cashAfterBuysAndSells / tmonPrice);
-            double tmonBuyAmount = tmonBuyQty * tmonPrice;
+        // Оставляем 2% запас на проскальзывание и комиссии
+        double safeCash = cashAfterBuysAndSells * 0.98;
+        if (safeCash > tmonAsk && tmonAsk > 0) {
+            int tmonBuyQty = (int)(safeCash / tmonAsk);
+            double tmonBuyAmount = tmonBuyQty * tmonAsk;
             if (tmonBuyQty > 0) {
-                System.out.println("  [INFO] Остаток кэша " + fmt(cashAfterBuysAndSells) + " р. → докупаем " + tmonBuyQty + " шт. TMON@");
-                actions.add(new RebalanceAction("BUY", "TMON@", tmonFigi, tmonClassCode, tmonUid, tmonBuyQty, tmonPrice, tmonBuyAmount));
+                System.out.println("  [INFO] Остаток кэша " + fmt(cashAfterBuysAndSells) + " р. → докупаем " + tmonBuyQty + " шт. TMON@ по ask " + fmt(tmonAsk, 2) + " р.");
+                actions.add(new RebalanceAction("BUY", "TMON@", tmonFigi, tmonClassCode, tmonUid, tmonBuyQty, 1, tmonAsk, tmonBuyAmount));
             }
         }
 
         if (tmonTargetWeight > 0) {
             analyses.add(new InstrumentAnalysis(
                 new RebalanceTarget("ETF", "TMON@", tmonTargetWeight), tmonInstrument,
-                tmonPosition != null ? tmonPosition.quantity : 0.0, tmonPrice, tmonPositionValue,
+                tmonPosition != null ? tmonPosition.quantity : 0.0, tmonAsk, tmonPositionValue,
                 tmonTargetValue, tmonDiffValue, tmonDiffQty));
         }
 
@@ -634,33 +672,178 @@ public class RebalanceScanner {
         }
     }
 
+    // ── Order state polling ──────────────────────────────────────────
+
+    static String getOrderState(String accountId, String orderId) {
+        String json = post("https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/GetOrderState",
+            "{\"accountId\": \"" + accountId + "\", \"orderId\": \"" + orderId + "\"}", 2, true);
+        if (json == null) return null;
+        return extractString(json, "executedExecutedQuantity");
+    }
+
+    static void waitForOrderComplete(String accountId, String orderId, String ticker) {
+        System.out.println("  [WAIT] Ожидание исполнения ордера " + ticker + "...");
+        for (int i = 0; i < 15; i++) {
+            try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+            String status = getOrderState(accountId, orderId);
+            if (status != null && !status.isEmpty()) {
+                System.out.println("  [OK] Ордер " + ticker + " исполнен: " + status);
+                return;
+            }
+            System.out.print(".");
+        }
+        System.out.println();
+        System.out.println("  [WARN] Ордер " + ticker + " не исполнен за 30 сек.");
+    }
+
     // ── Execute rebalancing ──────────────────────────────────────────
 
-    static void executeRebalancing(String accountId, List<RebalanceAction> actions) {
-        if (actions.isEmpty()) return;
+    static List<String> getActiveOrders(String accountId) {
+        String json = post("https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/GetOrders",
+            "{\"accountId\": \"" + accountId + "\"}", 2, true);
+        if (json == null) return Collections.emptyList();
+        List<String> orderIds = new ArrayList<>();
+        int searchStart = 0;
+        while (true) {
+            int idx = json.indexOf("\"orderId\"", searchStart);
+            if (idx < 0) break;
+            String orderId = extractString(json.substring(idx), "orderId");
+            if (!orderId.isEmpty()) orderIds.add(orderId);
+            searchStart = idx + 10;
+        }
+        return orderIds;
+    }
+
+    static boolean cancelOrder(String accountId, String orderId) {
+        String json = post("https://invest-public-api.tbank.ru/rest/tinkoff.public.invest.api.contract.v1.OrdersService/CancelOrder",
+            "{\"accountId\": \"" + accountId + "\", \"orderId\": \"" + orderId + "\"}", 2, true);
+        return json != null && json.contains("canceled");
+    }
+
+    /** Получить свежие bid/ask из стакана */
+    static double[] fetchPrices(String ticker, String classCode) {
+        String instrumentId = ticker + "_" + classCode;
+        double[] prices = getOrderBookBestPrices(instrumentId);
+        if (prices != null) return prices;
+        // fallback: последняя цена
+        Map<String, Double> lp = getLastPrices(Collections.singletonList(instrumentId));
+        Double p = lp.get(instrumentId);
+        if (p != null) return new double[]{p, p};
+        return null;
+    }
+
+    /** Рассчитать количество лотов по сумме и цене */
+    static int calcLots(double amount, double price, int lotSize) {
+        if (price <= 0 || lotSize <= 0) return 0;
+        return Math.max((int)(amount / price / lotSize), 0);
+    }
+
+    static void executeRebalancing(String accountId, List<RebalanceAction> sellActions, List<RebalanceAction> buyActions) {
         System.out.println();
         System.out.println("================================================================");
         System.out.println("  ВЫПОЛНЕНИЕ РЕБАЛАНСИРОВКИ");
         System.out.println("================================================================");
 
-        for (RebalanceAction a : actions) {
-            if (a.type.equals("SELL")) {
-                System.out.printf("  [SELL] %s: %d шт по %s р.\n", a.ticker, a.quantity, fmt(a.price, 2));
-                String orderId = postOrder(accountId, a.figi, a.quantity, "ORDER_DIRECTION_SELL", a.ticker, a.classCode, a.uid);
-                if (orderId != null) System.out.println("  [OK] Ордер: " + orderId);
-                else System.out.println("  [WARN] Не удалось разместить ордер на продажу " + a.ticker);
-                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+        double cash = getWithdrawLimits(accountId);
+        System.out.println("  Свободный кэш: " + fmt(cash, 2) + " руб.");
+
+        // 1. Продажи (свежая цена bid)
+        for (RebalanceAction a : sellActions) {
+            double[] prices = fetchPrices(a.ticker, a.classCode);
+            double bid = prices != null ? prices[0] : a.price;
+            System.out.printf("  [SELL] %s: %d шт по bid %s р.\n", a.ticker, a.quantity, fmt(bid, 2));
+            String orderId = postOrder(accountId, a.figi, a.quantity, "ORDER_DIRECTION_SELL", a.ticker, a.classCode, a.uid);
+            if (orderId != null) {
+                System.out.println("  [OK] Ордер: " + orderId);
+                cash += a.quantity * bid;
+                System.out.println("  [INFO] Кэш после продажи: " + fmt(cash, 2) + " руб.");
+            } else {
+                System.out.println("  [WARN] Не удалось продать " + a.ticker + ", кэш не изменился");
+            }
+            try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
+        }
+
+        // 2. Пересчитываем покупки с реальным кэшем, распределяя пропорционально
+        System.out.println();
+        System.out.println("  --- План покупок (кэш: " + fmt(cash, 2) + " руб.) ---");
+
+        // Считаем суммарный вес целей по акциям (без TMON@)
+        double totalStockWeight = 0;
+        for (RebalanceAction a : buyActions) {
+            if (!a.ticker.equals("TMON@")) totalStockWeight += a.amount;
+        }
+        if (totalStockWeight <= 0) totalStockWeight = 1;
+
+        List<RebalanceAction> actualBuys = new ArrayList<>();
+        List<RebalanceAction> skippedBuys = new ArrayList<>();
+        for (RebalanceAction a : buyActions) {
+            if (a.ticker.equals("TMON@")) continue;
+            double[] prices = fetchPrices(a.ticker, a.classCode);
+            double ask = prices != null ? prices[1] : a.price;
+            int lot = a.lot > 0 ? a.lot : 1;
+
+            double share = cash * (a.amount / totalStockWeight);
+            int qty = calcLots(share, ask, lot);
+            if (qty <= 0) {
+                // Сохраняем для повторной попытки из остатка
+                skippedBuys.add(new RebalanceAction("BUY", a.ticker, a.figi, a.classCode, a.uid, 0, lot, ask, 0));
+                System.out.printf("  [SKIP] %s: доля %s р., 1 лот=%s р. (попробую из остатка)\n",
+                    a.ticker, fmt(share, 2), fmt(ask * lot, 2));
+                continue;
+            }
+            double cost = qty * lot * ask;
+            actualBuys.add(new RebalanceAction("BUY", a.ticker, a.figi, a.classCode, a.uid, qty, lot, ask, cost));
+            cash -= cost;
+            System.out.printf("  [PLAN] %s: %d лот(ов) (%d шт) x %s р. = %s р. (остаток: %s р.)\n",
+                a.ticker, qty, qty * lot, fmt(ask, 2), fmt(cost, 2), fmt(cash, 2));
+        }
+
+        // Повторная попытка для пропущенных бумаг из остатка кэша
+        if (!skippedBuys.isEmpty() && cash > 0) {
+            System.out.println();
+            for (RebalanceAction a : skippedBuys) {
+                double[] prices = fetchPrices(a.ticker, a.classCode);
+                double ask = prices != null ? prices[1] : a.price;
+                int lot = a.lot;
+                int qty = calcLots(cash, ask, lot);
+                if (qty <= 0) continue;
+                double cost = qty * lot * ask;
+                actualBuys.add(new RebalanceAction("BUY", a.ticker, a.figi, a.classCode, a.uid, qty, lot, ask, cost));
+                cash -= cost;
+                System.out.printf("  [PLAN] %s: %d лот(ов) (%d шт) x %s р. = %s р. (остаток: %s р.)\n",
+                    a.ticker, qty, qty * lot, fmt(ask, 2), fmt(cost, 2), fmt(cash, 2));
             }
         }
 
-        for (RebalanceAction a : actions) {
-            if (a.type.equals("BUY")) {
-                System.out.printf("  [BUY] %s: %d шт по %s р.\n", a.ticker, a.quantity, fmt(a.price, 2));
-                String orderId = postOrder(accountId, a.figi, a.quantity, "ORDER_DIRECTION_BUY", a.ticker, a.classCode, a.uid);
-                if (orderId != null) System.out.println("  [OK] Ордер: " + orderId);
-                else System.out.println("  [WARN] Не удалось разместить ордер на покупку " + a.ticker);
-                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+        // TMON@ — покупаем остаток кэша
+        if (cash > 160) {
+            double[] tmonPrices = fetchPrices("TMON@", "SPBRU");
+            double tmonAsk = tmonPrices != null ? tmonPrices[1] : 160.0;
+            double safeCash = cash * 0.98;
+            int tmonQty = (int)(safeCash / tmonAsk);
+            if (tmonQty > 0) {
+                double cost = tmonQty * tmonAsk;
+                actualBuys.add(new RebalanceAction("BUY", "TMON@", "TCS70A106DL2", "SPBRU", "", tmonQty, 1, tmonAsk, cost));
+                System.out.printf("  [PLAN] TMON@: %d шт x %s р. = %s р.\n",
+                    tmonQty, fmt(tmonAsk, 2), fmt(cost, 2));
             }
+        }
+
+        if (actualBuys.isEmpty()) {
+            System.out.println("  [INFO] Нет足够的 кэша для покупок");
+            System.out.println("  [OK] Ребалансировка завершена.");
+            return;
+        }
+
+        // 3. Исполняем план покупок
+        System.out.println();
+        for (RebalanceAction a : actualBuys) {
+            System.out.printf("  [BUY] %s: %d лот(ов) (%d шт) по %s р.\n",
+                a.ticker, a.quantity, a.quantity * a.lot, fmt(a.price, 2));
+            String orderId = postOrder(accountId, a.figi, a.quantity, "ORDER_DIRECTION_BUY", a.ticker, a.classCode, a.uid);
+            if (orderId != null) System.out.println("  [OK] Ордер: " + orderId);
+            else System.out.println("  [WARN] Не удалось купить " + a.ticker);
+            try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
         }
 
         System.out.println("  [OK] Ребалансировка завершена.");
@@ -780,7 +963,13 @@ public class RebalanceScanner {
 
         // Execute if auto mode
         if (autoMode && !actions.isEmpty()) {
-            executeRebalancing(accountId, actions);
+            List<RebalanceAction> sellActions = new ArrayList<>();
+            List<RebalanceAction> buyActions = new ArrayList<>();
+            for (RebalanceAction a : actions) {
+                if (a.type.equals("SELL")) sellActions.add(a);
+                else buyActions.add(a);
+            }
+            executeRebalancing(accountId, sellActions, buyActions);
         }
     }
 }
